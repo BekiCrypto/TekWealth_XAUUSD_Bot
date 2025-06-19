@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  line-height: 1.5;
+}
+
+.backdrop-blur-xl {
+  backdrop-filter: blur(16px);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1f2937;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
+
+/* Animation classes */
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: .5;
+  }
+}
+
+.animate-bounce {
+  animation: bounce 1s infinite;
+}
+
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(-25%);
+    animation-timing-function: cubic-bezier(0.8,0,1,1);
+  }
+  50% {
+    transform: none;
+    animation-timing-function: cubic-bezier(0,0,0.2,1);
+  }
+}
+
+/* Trading chart styles */
+.recharts-cartesian-axis-tick-value {
+  fill: #9CA3AF;
+  font-size: 12px;
+}
+
+.recharts-tooltip-wrapper {
+  background: rgba(17, 24, 39, 0.95) !important;
+  border: 1px solid #374151 !important;
+  border-radius: 8px !important;
+  backdrop-filter: blur(8px);
+}
+
+.recharts-default-tooltip {
+  background: transparent !important;
+  border: none !important;
+  color: white !important;
+}
+
+/* Gradient backgrounds */
+.bg-gradient-gold {
+  background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+}
+
+.bg-gradient-dark {
+  background: linear-gradient(135deg, #111827 0%, #1f2937 100%);
+}
+
+/* Button hover effects */
+.btn-glow:hover {
+  box-shadow: 0 0 20px rgba(251, 191, 36, 0.3);
+}
+
+/* Glass morphism effect */
+.glass {
+  background: rgba(17, 24, 39, 0.7);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Trading status indicators */
+.status-online {
+  position: relative;
+}
+
+.status-online::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 12px;
+  height: 12px;
+  background: #10b981;
+  border-radius: 50%;
+  border: 2px solid #111827;
+}
+
+/* Price movement animations */
+.price-up {
+  color: #10b981;
+  animation: flash-green 0.5s ease-in-out;
+}
+
+.price-down {
+  color: #ef4444;
+  animation: flash-red 0.5s ease-in-out;
+}
+
+@keyframes flash-green {
+  0% { background-color: rgba(16, 185, 129, 0.2); }
+  50% { background-color: rgba(16, 185, 129, 0.4); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flash-red {
+  0% { background-color: rgba(239, 68, 68, 0.2); }
+  50% { background-color: rgba(239, 68, 68, 0.4); }
+  100% { background-color: transparent; }
+}
