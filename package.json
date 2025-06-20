@@ -1,5 +1,5 @@
 {
-  "name": "gold-trading-bot",
+  "name": "goldbot-pro",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -10,15 +10,32 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@stripe/stripe-js": "^2.4.0",
+    "axios": "^1.6.5",
+    "bcryptjs": "^2.4.3",
+    "date-fns": "^3.2.0",
+    "framer-motion": "^10.18.0",
+    "js-cookie": "^3.0.5",
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "recharts": "^2.12.0"
+    "react-hook-form": "^7.49.2",
+    "react-hot-toast": "^2.4.1",
+    "react-query": "^3.39.3",
+    "recharts": "^2.12.0",
+    "socket.io-client": "^4.7.4",
+    "uuid": "^9.0.1",
+    "zod": "^3.22.4",
+    "zustand": "^4.4.7"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/js-cookie": "^3.0.6",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
+    "@types/uuid": "^9.0.7",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.18",
     "eslint": "^9.9.1",
