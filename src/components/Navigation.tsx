@@ -7,19 +7,27 @@ import {
   TrendingUp, 
   Shield,
   LogOut,
-  Crown
+  Crown,
+  Cpu
 } from 'lucide-react';
+import { useAuthContext } from './auth/AuthProvider';
 
 interface NavigationProps {
   currentPage: string;
   onNavigate: (page: string) => void;
   userRole: 'admin' | 'subscriber' | null;
-  onLogout: () => void;
 }
 
-export function Navigation({ currentPage, onNavigate, userRole, onLogout }: NavigationProps) {
+export function Navigation({ currentPage, onNavigate, userRole }: NavigationProps) {
+  const { signOut } = useAuthContext();
+
+  const handleLogout = async () => {
+    await signOut();
+  };
+
   const adminItems = [
     { id: 'admin', label: 'Admin Panel', icon: Crown },
+    { id: 'engine', label: 'Trading Engine', icon: Cpu },
     { id: 'analytics', label: 'System Analytics', icon: BarChart3 },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
@@ -69,7 +77,7 @@ export function Navigation({ currentPage, onNavigate, userRole, onLogout }: Navi
 
       <div className="absolute bottom-6 left-6 right-6">
         <button
-          onClick={onLogout}
+          onClick={handleLogout}
           className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-gray-300 hover:bg-red-500/20 hover:text-red-400 transition-all"
         >
           <LogOut className="w-5 h-5" />
