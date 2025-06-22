@@ -19,6 +19,357 @@ const corsHeaders = {
 let latestGoldPrice: { price: number; timestamp: number } | null = null;
 const PRICE_CACHE_DURATION_MS = 5 * 60 * 1000; // Cache price for 5 minutes
 
+// --- Enhanced Trade Execution Abstraction ---
+// Parameter and Result Types
+interface ExecuteOrderParams {
+  userId: string;
+  tradingAccountId: string;
+  symbol: string;
+  tradeType: 'BUY' | 'SELL';
+  lotSize: number;
+  openPrice: number;
+  stopLossPrice: number;
+  takeProfitPrice?: number;
+  botSessionId?: string;
+}
+
+interface ExecuteOrderResult {
+  success: boolean;
+  tradeId?: string;
+  ticketId?: string;
+  error?: string;
+}
+
+interface CloseOrderParams {
+  ticketId: string;
+  lots?: number;
+  price?: number;
+  slippage?: number;
+  // For SimulatedTradeProvider to fetch current price:
+  userId?: string; // To potentially log who initiated close, or for simulated context
+  tradingAccountId?: string; // For simulated context
+}
+
+interface CloseOrderResult {
+  success: boolean;
+  ticketId: string;
+  closePrice?: number;
+  profit?: number;
+  error?: string;
+}
+
+interface AccountSummary {
+  balance: number;
+  equity: number;
+  margin: number;
+  freeMargin: number;
+  currency: string;
+  error?: string;
+}
+
+interface OpenPosition {
+  ticket: string;
+  symbol: string;
+  type: 'BUY' | 'SELL';
+  lots: number;
+  openPrice: number;
+  openTime: string;
+  stopLoss?: number;
+  takeProfit?: number;
+  currentPrice?: number;
+  profit?: number;
+  swap?: number;
+  comment?: string;
+}
+
+interface ServerTime {
+  time: string;
+  error?: string;
+}
+
+// Expanded Interface
+interface ITradeExecutionProvider {
+  executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult>;
+  closeOrder(params: CloseOrderParams): Promise<CloseOrderResult>;
+  getAccountSummary(tradingAccountId?: string): Promise<AccountSummary>;
+  getOpenPositions(tradingAccountId?: string): Promise<OpenPosition[]>;
+  getServerTime(): Promise<ServerTime>;
+}
+
+class SimulatedTradeProvider implements ITradeExecutionProvider {
+  private supabase: any;
+  private alphaVantageApiKey: string;
+
+  constructor(supabaseClient: any, alphaVantageApiKey: string) {
+    this.supabase = supabaseClient;
+    this.alphaVantageApiKey = alphaVantageApiKey;
+  }
+
+  async executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
+    try {
+      const ticketId = generateTicketId();
+      const { data: dbTrade, error } = await this.supabase
+        .from('trades')
+        .insert({
+          user_id: params.userId,
+          trading_account_id: params.tradingAccountId,
+          ticket_id: ticketId,
+          symbol: params.symbol,
+          trade_type: params.tradeType,
+          lot_size: params.lotSize,
+          open_price: params.openPrice,
+          stop_loss: params.stopLossPrice,
+          take_profit: params.takeProfitPrice,
+          status: 'open',
+          bot_session_id: params.botSessionId,
+        })
+        .select('id')
+        .single();
+
+      if (error) {
+        console.error('SimulatedTradeProvider: Error inserting trade:', error);
+        return { success: false, error: error.message, ticketId };
+      }
+      if (!dbTrade || !dbTrade.id) {
+        return { success: false, error: "SimulatedTradeProvider: Failed to insert trade or retrieve its ID.", ticketId };
+      }
+      return { success: true, tradeId: dbTrade.id, ticketId };
+    } catch (e) {
+      console.error('SimulatedTradeProvider: Exception in executeOrder:', e);
+      return { success: false, error: e.message };
+    }
+  }
+
+  async closeOrder(params: CloseOrderParams): Promise<CloseOrderResult> {
+    const { ticketId } = params;
+    try {
+      // For simulated close, we need the current market price.
+      // This assumes the close is for XAUUSD if not specified otherwise.
+      const currentPrice = await getCurrentGoldPrice(this.alphaVantageApiKey);
+
+      const { data: tradeToClose, error: fetchError } = await this.supabase
+        .from('trades')
+        .select('*')
+        .eq('id', ticketId) // Assuming ticketId is the database UUID 'id'
+        .eq('status', 'open')
+        .single();
+
+      if (fetchError) throw new Error(`Error fetching trade to close: ${fetchError.message}`);
+      if (!tradeToClose) return { success: false, ticketId, error: "Open trade with specified ID not found." };
+
+      const priceDiff = tradeToClose.trade_type === 'BUY'
+        ? currentPrice - tradeToClose.open_price
+        : tradeToClose.open_price - currentPrice;
+      const profitLoss = priceDiff * tradeToClose.lot_size * 100;
+
+      const { error: updateError } = await this.supabase
+        .from('trades')
+        .update({
+          close_price: currentPrice,
+          profit_loss: profitLoss,
+          status: 'closed',
+          close_time: new Date().toISOString(),
+        })
+        .eq('id', ticketId);
+
+      if (updateError) throw new Error(`Error updating trade to closed: ${updateError.message}`);
+      return { success: true, ticketId, closePrice: currentPrice, profit: parseFloat(profitLoss.toFixed(2)) };
+    } catch (e) {
+      console.error('SimulatedTradeProvider: Exception in closeOrder:', e);
+      return { success: false, ticketId, error: e.message };
+    }
+  }
+
+  async getAccountSummary(tradingAccountId?: string): Promise<AccountSummary> {
+    if (tradingAccountId) {
+        const {data, error} = await this.supabase
+            .from('trading_accounts') // Assuming you have a table storing account details
+            .select('account_balance, equity, margin, free_margin, currency')
+            .eq('id', tradingAccountId)
+            .single();
+        if (error || !data) {
+            console.error("SimulatedTradeProvider: Error fetching account summary from DB for account:", tradingAccountId, error);
+            return { balance: 0, equity: 0, margin: 0, freeMargin: 0, currency: 'USD', error: "Account not found or DB error."};
+        }
+        return {
+            balance: data.account_balance || 0,
+            equity: data.equity || 0,
+            margin: data.margin || 0,
+            freeMargin: data.free_margin || 0,
+            currency: data.currency || 'USD'
+        };
+    }
+    // Fallback static data if no specific tradingAccountId is provided
+    return { balance: 10000, equity: 10000, margin: 0, freeMargin: 10000, currency: 'USD', error: "No accountId provided, returning default summary." };
+  }
+
+  async getOpenPositions(tradingAccountId?: string): Promise<OpenPosition[]> {
+    try {
+      let query = this.supabase.from('trades').select('*').eq('status', 'open');
+      if (tradingAccountId) {
+        query = query.eq('trading_account_id', tradingAccountId);
+      }
+      const { data, error } = await query;
+      if (error) throw error;
+
+      return (data || []).map(t => ({
+        ticket: t.id,
+        symbol: t.symbol,
+        type: t.trade_type,
+        lots: t.lot_size,
+        openPrice: t.open_price,
+        openTime: t.created_at,
+        stopLoss: t.stop_loss,
+        takeProfit: t.take_profit,
+        comment: t.bot_session_id ? `BotSess:${t.bot_session_id}` : (t.ticket_id || '')
+        // currentPrice and profit would need live price fetching here if desired for this view
+      }));
+    } catch (e) {
+      console.error('SimulatedTradeProvider: Exception in getOpenPositions:', e);
+      return [];
+    }
+  }
+
+  async getServerTime(): Promise<ServerTime> {
+    return { time: new Date().toISOString() };
+  }
+}
+
+class MetaTraderBridgeProvider implements ITradeExecutionProvider {
+  private bridgeUrl: string;
+  private bridgeApiKey: string;
+
+  constructor(bridgeUrl: string, bridgeApiKey: string) {
+    if (!bridgeUrl || !bridgeApiKey) {
+      throw new Error("MetaTraderBridgeProvider: bridgeUrl and bridgeApiKey are required.");
+    }
+    this.bridgeUrl = bridgeUrl.endsWith('/') ? bridgeUrl.slice(0, -1) : bridgeUrl;
+    this.bridgeApiKey = bridgeApiKey;
+  }
+
+  private async makeRequest(endpoint: string, method: string, body?: any): Promise<any> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-MT-Bridge-API-Key': this.bridgeApiKey,
+    };
+    try {
+      const response = await fetch(`${this.bridgeUrl}${endpoint}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text(); // Get text first for better debugging
+        let errorData;
+        try {
+            errorData = JSON.parse(errorText);
+        } catch (e) {
+            errorData = { error: "Failed to parse error response from bridge", details: errorText };
+        }
+        console.error(`MetaTraderBridgeProvider Error: ${response.status} ${response.statusText}`, errorData);
+        throw new Error(`Bridge API Error (${endpoint}): ${response.status} - ${errorData.error || response.statusText}`);
+      }
+      // Handle cases where response might be empty for 202/204 status
+      if (response.status === 202 || response.status === 204) {
+          return { success: true, message: `Request to ${endpoint} accepted.` }; // Or an empty object if preferred
+      }
+      return await response.json();
+    } catch (error) {
+      console.error(`MetaTraderBridgeProvider Request Failed (${endpoint}):`, error);
+      throw error;
+    }
+  }
+
+  async executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
+    try {
+      const requestBody = {
+        symbol: params.symbol,
+        type: params.tradeType,
+        lots: params.lotSize,
+        price: params.openPrice,
+        stopLossPrice: params.stopLossPrice,
+        takeProfitPrice: params.takeProfitPrice,
+        magicNumber: params.botSessionId ? parseInt(params.botSessionId.replace(/\D/g,'').slice(-7)) || 0 : 0,
+        comment: `BotTrade_Sess${params.botSessionId || 'N/A'}`,
+      };
+      const responseData = await this.makeRequest('/order/execute', 'POST', requestBody);
+      if (responseData.success && responseData.ticket) {
+        return { success: true, tradeId: responseData.ticket.toString(), ticketId: responseData.ticket.toString() };
+      } else {
+        return { success: false, error: responseData.error || "Failed to execute order via bridge." };
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async closeOrder(params: CloseOrderParams): Promise<CloseOrderResult> {
+    try {
+      const responseData = await this.makeRequest('/order/close', 'POST', {
+        ticket: parseInt(params.ticketId),
+        lots: params.lots,
+      });
+      if (responseData.success) {
+        return { success: true, ticketId: params.ticketId, closePrice: responseData.closePrice, profit: responseData.profit };
+      } else {
+        return { success: false, ticketId: params.ticketId, error: responseData.error || "Failed to close order via bridge." };
+      }
+    } catch (error) {
+      return { success: false, ticketId: params.ticketId, error: error.message };
+    }
+  }
+
+  async getAccountSummary(): Promise<AccountSummary> {
+    try {
+      const data = await this.makeRequest('/account/summary', 'GET');
+      return {
+        balance: data.balance,
+        equity: data.equity,
+        margin: data.margin,
+        freeMargin: data.freeMargin,
+        currency: data.currency,
+      };
+    } catch (error) {
+      return { balance: 0, equity: 0, margin: 0, freeMargin: 0, currency: 'N/A', error: error.message };
+    }
+  }
+
+  async getOpenPositions(): Promise<OpenPosition[]> {
+     try {
+      const data = await this.makeRequest('/positions/open', 'GET');
+      return (data.positions || []).map((p: any) => ({
+          ticket: p.ticket.toString(),
+          symbol: p.symbol,
+          type: p.type,
+          lots: p.lots,
+          openPrice: p.openPrice,
+          openTime: p.openTime,
+          stopLoss: p.stopLoss,
+          takeProfit: p.takeProfit,
+          currentPrice: p.currentPrice,
+          profit: p.profit,
+          swap: p.swap,
+          comment: p.comment,
+      }));
+    } catch (error) {
+      console.error('MetaTraderBridgeProvider: Error fetching open positions:', error);
+      return [];
+    }
+  }
+
+  async getServerTime(): Promise<ServerTime> {
+    try {
+      const data = await this.makeRequest('/server/time', 'GET');
+      return { time: data.serverTime, error: data.error };
+    } catch (error) {
+      return { time: '', error: error.message };
+    }
+  }
+}
+// --- End Trade Execution Abstraction ---
+
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -222,6 +573,402 @@ async function sendEmail(
 }
 // --- End Email Sending Helper ---
 
+// --- Technical Indicator Utilities ---
+// (ohlcData expects objects with high_price, low_price, close_price)
+function calculateATR(ohlcData: Array<{high_price: number, low_price: number, close_price: number}>, period: number): (number | null)[] {
+  if (!ohlcData || ohlcData.length < period) {
+    return ohlcData.map(() => null); // Not enough data
+  }
+
+  const trValues: (number | null)[] = [null]; // TR for the first candle is null/undefined
+  for (let i = 1; i < ohlcData.length; i++) {
+    const high = ohlcData[i].high_price;
+    const low = ohlcData[i].low_price;
+    const prevClose = ohlcData[i-1].close_price;
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+    trValues.push(tr);
+  }
+
+  const atrValues: (number | null)[] = new Array(ohlcData.length).fill(null);
+  if (trValues.length < period) return atrValues; // Should not happen if ohlcData.length >= period
+
+  // Calculate first ATR (simple average of first 'period' TR values)
+  // We need 'period' TR values. Since trValues[0] is null, we start from trValues[1]
+  let sumTr = 0;
+  for (let i = 1; i <= period; i++) { // Summing 'period' TRs (trValues[1] to trValues[period])
+      if (trValues[i] === null) { // Should not happen if ohlcData is sufficient
+          // This case implies not enough data for the first ATR, fill with nulls
+          return atrValues;
+      }
+      sumTr += trValues[i] as number;
+  }
+  atrValues[period] = sumTr / period; // ATR is typically aligned with the *end* of its first calculation period
+
+  // Subsequent ATR values using Wilder's smoothing
+  for (let i = period + 1; i < ohlcData.length; i++) {
+    if (atrValues[i-1] === null || trValues[i] === null) { // Should not happen
+        atrValues[i] = null;
+        continue;
+    }
+    atrValues[i] = (((atrValues[i-1] as number) * (period - 1)) + (trValues[i] as number)) / period;
+  }
+  return atrValues;
+}
+
+function calculateSMA(prices: number[], period: number): (number | null)[] {
+  if (!prices || prices.length === 0) return [];
+  const smaValues: (number | null)[] = new Array(prices.length).fill(null);
+  if (prices.length < period) return smaValues;
+
+  let sum = 0;
+  for (let i = 0; i < period; i++) {
+    sum += prices[i];
+  }
+  smaValues[period - 1] = sum / period;
+
+  for (let i = period; i < prices.length; i++) {
+    sum = sum - prices[i - period] + prices[i];
+    smaValues[i] = sum / period;
+  }
+  return smaValues;
+}
+
+function calculateStdDev(prices: number[], period: number, smaValues: (number | null)[]): (number | null)[] {
+    if (!prices || prices.length < period) return new Array(prices.length).fill(null);
+    const stdDevValues: (number | null)[] = new Array(prices.length).fill(null);
+
+    for (let i = period - 1; i < prices.length; i++) {
+        if (smaValues[i] === null) continue;
+        const currentSma = smaValues[i] as number;
+        const slice = prices.slice(i - period + 1, i + 1);
+        let sumOfSquares = 0;
+        for (const price of slice) {
+            sumOfSquares += Math.pow(price - currentSma, 2);
+        }
+        stdDevValues[i] = Math.sqrt(sumOfSquares / period);
+    }
+    return stdDevValues;
+}
+
+
+function calculateBollingerBands(
+    ohlcData: Array<{close_price: number}>,
+    period: number,
+    stdDevMultiplier: number
+): Array<{middle: number | null, upper: number | null, lower: number | null}> {
+    if (!ohlcData || ohlcData.length < period) {
+        return ohlcData.map(() => ({ middle: null, upper: null, lower: null }));
+    }
+    const closePrices = ohlcData.map(d => d.close_price);
+    const middleBandValues = calculateSMA(closePrices, period);
+    const stdDevValues = calculateStdDev(closePrices, period, middleBandValues);
+
+    const bbValues: Array<{middle: number | null, upper: number | null, lower: number | null}> = [];
+    for (let i = 0; i < ohlcData.length; i++) {
+        if (middleBandValues[i] !== null && stdDevValues[i] !== null) {
+            const middle = middleBandValues[i] as number;
+            const stdDev = stdDevValues[i] as number;
+            bbValues.push({
+                middle: middle,
+                upper: middle + (stdDev * stdDevMultiplier),
+                lower: middle - (stdDev * stdDevMultiplier),
+            });
+        } else {
+            bbValues.push({ middle: null, upper: null, lower: null });
+        }
+    }
+    return bbValues;
+}
+
+function calculateRSI(ohlcData: Array<{close_price: number}>, period: number): (number | null)[] {
+    if (!ohlcData || ohlcData.length < period) {
+        return ohlcData.map(() => null);
+    }
+    const closePrices = ohlcData.map(d => d.close_price);
+    const rsiValues: (number | null)[] = new Array(closePrices.length).fill(null);
+
+    let gains: number[] = [];
+    let losses: number[] = [];
+
+    for (let i = 1; i < closePrices.length; i++) {
+        const change = closePrices[i] - closePrices[i-1];
+        gains.push(change > 0 ? change : 0);
+        losses.push(change < 0 ? Math.abs(change) : 0);
+    }
+
+    if (gains.length < period -1) return rsiValues; // Not enough data points for first calculation
+
+    let avgGain = 0;
+    let avgLoss = 0;
+
+    // Calculate first average gain and loss
+    for (let i = 0; i < period; i++) { // Sum first 'period' gains/losses (corresponds to period+1 close prices)
+        avgGain += gains[i];
+        avgLoss += losses[i];
+    }
+    avgGain /= period;
+    avgLoss /= period;
+
+    if (avgLoss === 0) {
+        rsiValues[period] = 100; // Avoid division by zero; if all losses are 0, RSI is 100
+    } else {
+        const rs = avgGain / avgLoss;
+        rsiValues[period] = 100 - (100 / (1 + rs));
+    }
+
+    // Subsequent RSI values using Wilder's smoothing for average gain/loss
+    for (let i = period; i < gains.length; i++) { // Loop from 'period'-th change (which is index period+1 in closePrices)
+        avgGain = ((avgGain * (period - 1)) + gains[i]) / period;
+        avgLoss = ((avgLoss * (period - 1)) + losses[i]) / period;
+
+        if (avgLoss === 0) {
+            rsiValues[i + 1] = 100;
+        } else {
+            const rs = avgGain / avgLoss;
+            rsiValues[i + 1] = 100 - (100 / (1 + rs));
+        }
+    }
+    return rsiValues;
+}
+
+
+// ADX function
+// Wilder's Smoothing (similar to an EMA with alpha = 1/period)
+function wildersSmoothing(values: (number | null)[], period: number): (number | null)[] {
+  const smoothed: (number | null)[] = new Array(values.length).fill(null);
+  if (values.length < period) return smoothed;
+
+  let sum = 0;
+  let validCount = 0;
+  for (let i = 0; i < period; i++) {
+    if (values[i] !== null) {
+      sum += values[i] as number;
+      validCount++;
+    }
+  }
+
+  if (validCount < period && validCount > 0) { // Partial sum if some initial values are null but not all
+      // This is a simplification; proper handling of leading nulls for first sum might be needed
+      // For now, if not all 'period' values are present for the first sum, we can't start.
+      // However, typical indicator usage implies data is present.
+  } else if (validCount === 0 && period > 0) {
+      return smoothed; // Cannot start if all initial values are null
+  }
+
+  // First smoothed value is the average of the first 'period' values
+  // This assumes that 'values' array starts with non-nulls for at least 'period' length if it's to work.
+  // Or, the nulls are at the beginning and the first valid sum starts after them.
+  // Let's find the first valid sum.
+  let firstValidIndex = -1;
+  for(let i = 0; i <= values.length - period; i++) {
+      sum = 0;
+      validCount = 0;
+      let canCalc = true;
+      for(let j=0; j < period; j++) {
+          if(values[i+j] === null) {
+              canCalc = false;
+              break;
+          }
+          sum += values[i+j] as number;
+      }
+      if(canCalc) {
+          smoothed[i + period -1] = sum / period;
+          firstValidIndex = i + period -1;
+          break;
+      }
+  }
+
+  if(firstValidIndex === -1) return smoothed; // Not enough contiguous data to start
+
+  for (let i = firstValidIndex + 1; i < values.length; i++) {
+    if (values[i] === null) {
+      smoothed[i] = smoothed[i-1]; // Carry forward if current value is null
+    } else if (smoothed[i-1] === null) {
+      // This case implies a gap, re-initialize sum if possible or continue null
+      // For simplicity, if previous smoothed is null due to prolonged nulls in input, this will also be null
+      // A more robust version might re-average.
+      smoothed[i] = null; // Or attempt re-averaging for 'period' if desired
+    }
+    else {
+      smoothed[i] = ((smoothed[i-1] as number * (period - 1)) + (values[i] as number)) / period;
+    }
+  }
+  return smoothed;
+}
+
+
+interface ADXValues {
+    pdi: (number | null)[]; // Positive Directional Indicator (+DI)
+    ndi: (number | null)[]; // Negative Directional Indicator (-DI)
+    adx: (number | null)[]; // Average Directional Index
+}
+
+function calculateADX(
+    ohlcData: Array<{high_price: number, low_price: number, close_price: number}>,
+    period: number = 14
+): ADXValues {
+    const results: ADXValues = {
+        pdi: new Array(ohlcData.length).fill(null),
+        ndi: new Array(ohlcData.length).fill(null),
+        adx: new Array(ohlcData.length).fill(null),
+    };
+
+    if (ohlcData.length < period + 1) { // Need at least period+1 bars for first calculation
+        return results;
+    }
+
+    const trValues = calculateATR(ohlcData, period).map((atr,idx) => {
+        // ATR is TR/(period) for first, then smoothed. We need raw TR for DM calculations.
+        // calculateATR's internal trValues are what we need.
+        // Let's recalculate TR here for clarity or make calculateATR return TRs.
+        // For now, direct TR calculation:
+        if (idx === 0) return null;
+        const high = ohlcData[idx].high_price;
+        const low = ohlcData[idx].low_price;
+        const prevClose = ohlcData[idx-1].close_price;
+        return Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    });
+
+
+    const pDM: (number | null)[] = [null]; // Positive Directional Movement
+    const nDM: (number | null)[] = [null]; // Negative Directional Movement
+
+    for (let i = 1; i < ohlcData.length; i++) {
+        const upMove = ohlcData[i].high_price - ohlcData[i-1].high_price;
+        const downMove = ohlcData[i-1].low_price - ohlcData[i].low_price;
+
+        pDM.push((upMove > downMove && upMove > 0) ? upMove : 0);
+        nDM.push((downMove > upMove && downMove > 0) ? downMove : 0);
+    }
+
+    const smoothedTR = wildersSmoothing(trValues, period);
+    const smoothedPDM = wildersSmoothing(pDM, period);
+    const smoothedNDM = wildersSmoothing(nDM, period);
+
+    const dxValues: (number | null)[] = new Array(ohlcData.length).fill(null);
+
+    for (let i = 0; i < ohlcData.length; i++) {
+        if (smoothedTR[i] && smoothedPDM[i] !== null && smoothedNDM[i] !== null) {
+            const sTR = smoothedTR[i] as number;
+            const sPDM = smoothedPDM[i] as number;
+            const sNDM = smoothedNDM[i] as number;
+
+            if (sTR > 0) {
+                results.pdi[i] = (sPDM / sTR) * 100;
+                results.ndi[i] = (sNDM / sTR) * 100;
+
+                const diSum = (results.pdi[i] as number) + (results.ndi[i] as number);
+                if (diSum > 0) {
+                    dxValues[i] = (Math.abs((results.pdi[i] as number) - (results.ndi[i] as number)) / diSum) * 100;
+                } else {
+                    dxValues[i] = 0; // Or null, if sum is 0, implies no directional movement
+                }
+            }
+        }
+    }
+
+    results.adx = wildersSmoothing(dxValues, period);
+
+    return results;
+}
+
+
+// --- Mean Reversion Strategy (Bollinger Bands + RSI) ---
+interface MeanReversionSettings {
+  bbPeriod?: number;
+  bbStdDevMult?: number;
+  rsiPeriod?: number;
+  rsiOversold?: number;
+  rsiOverbought?: number;
+  atrPeriod?: number; // For ATR calculation if not passed in
+  atrMultiplierSL?: number;
+  atrMultiplierTP?: number;
+}
+
+function analyzeMeanReversionStrategy(
+  ohlcDataForAnalysis: any[], // Expects objects with open_price, close_price, high_price, low_price
+  currentIndexForDecision: number,
+  settings: MeanReversionSettings,
+  currentAtrValue: number | null // ATR value for the candle *prior* to currentIndexForDecision
+): MarketAnalysisResult {
+  const {
+    bbPeriod = 20,
+    bbStdDevMult = 2,
+    rsiPeriod = 14,
+    rsiOversold = 30,
+    rsiOverbought = 70,
+    atrMultiplierSL = 1.5, // Default ATR SL multiplier from typical strategy settings
+    atrMultiplierTP = 3.0    // Default ATR TP multiplier
+  } = settings;
+
+  // Ensure we have enough data for indicators up to the signal candle (candle before decision candle)
+  // currentIndexForDecision is the candle we'd act on (e.g. its open)
+  // Indicators are based on data *up to* currentIndexForDecision - 1
+  const signalCandleIndex = currentIndexForDecision - 1;
+  if (signalCandleIndex < Math.max(bbPeriod, rsiPeriod)) {
+    return { shouldTrade: false }; // Not enough data for indicators
+  }
+
+  const decisionPrice = ohlcDataForAnalysis[currentIndexForDecision].open_price;
+
+  // Calculate indicators on the relevant slice of data ending at the signal candle
+  const dataSliceForIndicators = ohlcDataForAnalysis.slice(0, currentIndexForDecision); // Includes signalCandleIndex
+
+  const bbValues = calculateBollingerBands(dataSliceForIndicators, bbPeriod, bbStdDevMult);
+  const rsiValues = calculateRSI(dataSliceForIndicators, rsiPeriod);
+
+  const currentBB = bbValues[signalCandleIndex];
+  const currentRSI = rsiValues[signalCandleIndex];
+  const prevRSI = rsiValues[signalCandleIndex -1]; // For RSI turn confirmation
+
+  if (!currentBB || currentRSI === null || prevRSI === null || currentAtrValue === null) {
+    // console.log("MeanReversion: Indicator data missing for decision.", {currentBB, currentRSI, prevRSI, currentAtrValue});
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  const signalCandleClose = dataSliceForIndicators[signalCandleIndex].close_price;
+  let tradeType: 'BUY' | 'SELL' | undefined = undefined;
+
+  // Buy Signal Logic: Price near/below lower BB, RSI oversold and turning up
+  if (currentBB.lower && signalCandleClose <= currentBB.lower && currentRSI < rsiOversold && currentRSI > prevRSI) {
+    tradeType = 'BUY';
+  }
+  // Sell Signal Logic: Price near/above upper BB, RSI overbought and turning down
+  else if (currentBB.upper && signalCandleClose >= currentBB.upper && currentRSI > rsiOverbought && currentRSI < prevRSI) {
+    tradeType = 'SELL';
+  }
+
+  if (tradeType) {
+    const stopLoss = tradeType === 'BUY'
+      ? decisionPrice - (currentAtrValue * atrMultiplierSL)
+      : decisionPrice + (currentAtrValue * atrMultiplierSL);
+    const takeProfit = tradeType === 'BUY'
+      ? decisionPrice + (currentAtrValue * atrMultiplierTP)
+      : decisionPrice - (currentAtrValue * atrMultiplierTP);
+
+    // console.log(`MeanReversion Signal: ${tradeType} @ ${decisionPrice.toFixed(4)}, SL: ${stopLoss.toFixed(4)}, TP: ${takeProfit.toFixed(4)}, ATR: ${currentAtrValue.toFixed(4)}`);
+    return {
+      shouldTrade: true,
+      tradeType: tradeType,
+      priceAtDecision: decisionPrice,
+      stopLoss: parseFloat(stopLoss.toFixed(4)),
+      takeProfit: parseFloat(takeProfit.toFixed(4)),
+    };
+  }
+
+  return { shouldTrade: false, priceAtDecision: decisionPrice };
+}
+// --- End Mean Reversion Strategy ---
+
+
+// --- End Technical Indicator Utilities ---
+
+
 interface SimulatedTrade {
   entryTime: string;
   entryPrice: number;
@@ -244,9 +991,35 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
     startDate, // ISO Date string
     endDate,   // ISO Date string
     strategySettings = { shortPeriod: 20, longPeriod: 50 }, // Default SMA settings
-    // Default risk settings, similar to processBotSession
-    riskSettings = { riskLevel: 'conservative', maxLotSize: 0.01, stopLossPips: 200 }
+    // Default risk settings, now includes ATR multipliers
+    riskSettings = {
+      riskLevel: 'conservative',
+      maxLotSize: 0.01,
+      // stopLossPips is now less relevant if ATR is used, but keep for other strategies or fallback
+      stopLossPips: 200,
+      atrMultiplierSL: 1.5, // Default ATR SL multiplier
+      atrMultiplierTP: 3.0    // Default ATR TP multiplier
+    }
   } = data;
+
+  // Merge strategySettings from data with defaults for ATR if not provided by caller
+  const effectiveStrategySettings = {
+    smaShortPeriod: 20,
+    smaLongPeriod: 50,
+    atrPeriod: 14,
+    ...strategySettings // User-provided strategySettings will override defaults
+  };
+
+  // Merge riskSettings from data with defaults for ATR multipliers if not provided
+  const effectiveRiskSettings = {
+    riskLevel: 'conservative',
+    maxLotSize: 0.01,
+    stopLossPips: 200, // Kept for potential other uses or fallback
+    atrMultiplierSL: 1.5,
+    atrMultiplierTP: 3.0,
+    ...riskSettings // User-provided riskSettings will override defaults
+  };
+
 
   if (!startDate || !endDate) {
     return new Response(JSON.stringify({ error: "startDate and endDate are required." }), {
@@ -272,8 +1045,8 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
       .order('timestamp', { ascending: true });
 
     if (dbError) throw dbError;
-    if (!historicalOhlc || historicalOhlc.length < strategySettings.longPeriod) {
-      return new Response(JSON.stringify({ error: "Not enough historical data for the selected period or to meet strategy MA length." }), {
+    if (!historicalOhlc || historicalOhlc.length < Math.max(effectiveStrategySettings.smaLongPeriod, effectiveStrategySettings.atrPeriod +1) ) {
+      return new Response(JSON.stringify({ error: "Not enough historical data for the selected period or to meet strategy MA/ATR length." }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
@@ -281,9 +1054,12 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
     const tradesForDb: Omit<SimulatedTrade, 'status' | 'profitOrLoss' | 'closeReason'>[] = [];
     let openTrade: SimulatedTrade | null = null;
 
-    const pipsToPricePoints = (pips: number) => pips / 10;
+    // const pipsToPricePoints = (pips: number) => pips / 10; // Replaced by ATR logic
 
-    for (let i = strategySettings.longPeriod; i < historicalOhlc.length; i++) {
+    // Start loop from where all indicators can be valid
+    const loopStartIndex = Math.max(effectiveStrategySettings.smaLongPeriod, effectiveStrategySettings.atrPeriod + 1);
+
+    for (let i = loopStartIndex; i < historicalOhlc.length; i++) {
       const currentCandle = historicalOhlc[i];
       const currentTime = currentCandle.timestamp;
       const currentLowPrice = currentCandle.low_price;
@@ -315,19 +1091,27 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
 
       const analysisResult = await analyzeMarketConditions(
         apiKey,
-        strategySettings.shortPeriod,
-        strategySettings.longPeriod,
+        { // Pass full strategyParams object
+            smaShortPeriod: effectiveStrategySettings.smaShortPeriod,
+            smaLongPeriod: effectiveStrategySettings.smaLongPeriod,
+            atrPeriod: effectiveStrategySettings.atrPeriod,
+            atrMultiplierSL: effectiveRiskSettings.atrMultiplierSL,
+            atrMultiplierTP: effectiveRiskSettings.atrMultiplierTP,
+        },
         historicalOhlc,
         i
       );
 
-      if (openTrade) {
-        if ((openTrade.tradeType === 'BUY' && analysisResult.shouldTrade && analysisResult.tradeType === 'SELL') ||
-            (openTrade.tradeType === 'SELL' && analysisResult.shouldTrade && analysisResult.tradeType === 'BUY')) {
-          const exitPrice = analysisResult.priceAtDecision as number;
-          const priceDiff = openTrade.tradeType === 'BUY' ? exitPrice - openTrade.entryPrice : openTrade.entryPrice - exitPrice;
+      // C. Handle Signals
+      if (openTrade) { // If a trade is open
+        // Check for exit signal (e.g., opposite crossover)
+        if (analysisResult.shouldTrade && analysisResult.tradeType !== openTrade.tradeType) {
+          const exitPrice = analysisResult.priceAtDecision as number; // Exit at the decision price of the opposite signal
+          const priceDiff = openTrade.tradeType === 'BUY'
+            ? exitPrice - openTrade.entryPrice
+            : openTrade.entryPrice - exitPrice;
           tradesForDb.push({
-            ...openTrade,
+            ...openTrade, // Spreads existing openTrade properties
             exitTime: currentTime,
             exitPrice: exitPrice,
             profitOrLoss: priceDiff * openTrade.lotSize * 100,
@@ -335,17 +1119,40 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
           });
           openTrade = null;
         }
-      } else {
-        if (analysisResult.shouldTrade && analysisResult.tradeType && analysisResult.priceAtDecision) {
-          const entryPrice = analysisResult.priceAtDecision;
-          const stopLossDistance = pipsToPricePoints(riskSettings.stopLossPips);
+        // Add Take Profit Check if TP is defined for the open trade
+        else if (openTrade.takeProfitPrice) {
+            let tpHit = false;
+            if (openTrade.tradeType === 'BUY' && currentHighPrice >= openTrade.takeProfitPrice) {
+                tpHit = true;
+                openTrade.exitPrice = openTrade.takeProfitPrice;
+            } else if (openTrade.tradeType === 'SELL' && currentLowPrice <= openTrade.takeProfitPrice) {
+                tpHit = true;
+                openTrade.exitPrice = openTrade.takeProfitPrice;
+            }
+            if (tpHit) {
+                const priceDiff = openTrade.tradeType === 'BUY'
+                    ? (openTrade.exitPrice as number) - openTrade.entryPrice
+                    : openTrade.entryPrice - (openTrade.exitPrice as number);
+                tradesForDb.push({
+                    ...openTrade,
+                    exitTime: currentTime,
+                    profitOrLoss: priceDiff * openTrade.lotSize * 100,
+                    closeReason: 'TP'
+                });
+                openTrade = null;
+            }
+        }
+
+      } else { // No open trade, look for entry
+        if (analysisResult.shouldTrade && analysisResult.tradeType && analysisResult.priceAtDecision && analysisResult.stopLoss) {
           openTrade = {
             entryTime: currentTime,
-            entryPrice: entryPrice,
+            entryPrice: analysisResult.priceAtDecision,
             tradeType: analysisResult.tradeType,
-            lotSize: riskSettings.maxLotSize,
-            stopLossPrice: analysisResult.tradeType === 'BUY' ? entryPrice - stopLossDistance : entryPrice + stopLossDistance,
-            status: 'open', // status is internal to loop, not stored directly this way in tradesForDb
+            lotSize: effectiveRiskSettings.maxLotSize,
+            stopLossPrice: analysisResult.stopLoss,
+            takeProfitPrice: analysisResult.takeProfit, // Will be undefined if not set by strategy
+            status: 'open',
           };
         }
       }
@@ -720,7 +1527,9 @@ function calculateSMA(prices: number[], period: number): number | null {
 interface MarketAnalysisResult {
   shouldTrade: boolean;
   tradeType?: 'BUY' | 'SELL';
-  priceAtDecision?: number; // The price at which the decision is made (e.g., open of current candle in backtest)
+  priceAtDecision?: number;
+  stopLoss?: number; // Added for dynamic SL
+  takeProfit?: number; // Added for dynamic TP
 }
 
 // --- Trade Execution Abstraction ---
@@ -1105,14 +1914,28 @@ class MetaTraderBridgeProvider implements ITradeExecutionProvider {
 
 // Refactored for backtesting and live trading
 async function analyzeMarketConditions(
-  apiKey: string,
-  shortPeriod: number = 20,
-  longPeriod: number = 50,
+  apiKey: string, // Still needed for live mode's getCurrentGoldPrice if not fully covered by ohlcData
+  strategyParams: { // Grouping strategy-specific parameters
+    smaShortPeriod?: number,
+    smaLongPeriod?: number,
+    atrPeriod?: number,
+    atrMultiplierSL?: number,
+    atrMultiplierTP?: number,
+    // Add other strategy params here as needed (e.g., for BB, RSI, ADX later)
+  } = { smaShortPeriod: 20, smaLongPeriod: 50, atrPeriod: 14, atrMultiplierSL: 1.5, atrMultiplierTP: 3 },
   // Optional parameters for backtesting:
-  ohlcDataForAnalysis?: any[], // Pre-fetched OHLC data
-  currentIndexForDecision?: number // Index of the current candle in ohlcDataForAnalysis for decision making
+  ohlcDataForAnalysis?: any[],
+  currentIndexForDecision?: number
 ): Promise<MarketAnalysisResult> {
   try {
+    const {
+      smaShortPeriod = 20,
+      smaLongPeriod = 50,
+      atrPeriod = 14,
+      atrMultiplierSL = 1.5,
+      atrMultiplierTP = 3
+    } = strategyParams;
+
     let decisionPrice: number;
     let relevantHistoricalData: any[];
 
@@ -1133,47 +1956,62 @@ async function analyzeMarketConditions(
       decisionPrice = await getCurrentGoldPrice(apiKey); // This is the most recent tick price
     }
 
-    if (relevantHistoricalData.length < longPeriod) {
-      // console.warn(`Not enough historical data for MA calculation. Have ${relevantHistoricalData.length}, need ${longPeriod}`);
+    // Ensure enough data for the longest period of SMAs and ATR
+    const requiredDataLength = Math.max(smaLongPeriod, atrPeriod +1); // ATR needs period+1 to have a valid value at index 'period'
+    if (relevantHistoricalData.length < requiredDataLength) {
       return { shouldTrade: false, priceAtDecision: decisionPrice };
     }
 
-    const closePrices = relevantHistoricalData.map(p => p.close_price || p.close); // Adapt to property name
+    const closePrices = relevantHistoricalData.map(p => p.close_price || p.close);
 
-    // SMAs for the most recent completed candle available in relevantHistoricalData
-    const smaShort = calculateSMA(closePrices, shortPeriod);
-    const smaLong = calculateSMA(closePrices, longPeriod);
+    const smaShort = calculateSMA(closePrices, smaShortPeriod);
+    const smaLong = calculateSMA(closePrices, smaLongPeriod);
 
-    // SMAs for the candle *before* the most recent completed one
-    // This means removing the last element from closePrices before calculating previous MAs
-    const smaShortPrev = calculateSMA(closePrices.slice(0, -1), shortPeriod);
-    const smaLongPrev = calculateSMA(closePrices.slice(0, -1), longPeriod);
+    const smaShortPrev = calculateSMA(closePrices.slice(0, -1), smaShortPeriod);
+    const smaLongPrev = calculateSMA(closePrices.slice(0, -1), smaLongPeriod);
 
-    if (smaShort === null || smaLong === null || smaShortPrev === null || smaLongPrev === null) {
-      // console.log("Could not calculate SMAs (null).", { smaShort, smaLong, smaShortPrev, smaLongPrev });
+    // Calculate ATR
+    // For ATR, we need the data up to the point of decision (currentIndexForDecision -1 for backtest, or latest for live)
+    // The ATR value at index `k` corresponds to the ATR *after* candle `k` has closed.
+    // So for a decision at candle `i`, we use ATR value from candle `i-1`.
+    const atrValues = calculateATR(relevantHistoricalData, atrPeriod);
+    const currentAtr = atrValues[relevantHistoricalData.length - 1]; // ATR of the last fully formed candle in relevantHistoricalData
+
+    if (smaShort === null || smaLong === null || smaShortPrev === null || smaLongPrev === null || currentAtr === null) {
       return { shouldTrade: false, priceAtDecision: decisionPrice };
     }
 
-    // In live mode, log current state
-    if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) {
-        console.log(`SMA Analysis (Live): Decision Price: ${decisionPrice}, SMA(${shortPeriod}): ${smaShort.toFixed(2)}, SMA(${longPeriod}): ${smaLong.toFixed(2)}`);
-        console.log(`SMA Analysis (Live): Prev SMA(${shortPeriod}): ${smaShortPrev.toFixed(2)}, Prev SMA(${longPeriod}): ${smaLongPrev.toFixed(2)}`);
+    if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) { // Live mode logging
+        console.log(`SMA Analysis (Live): Decision Price: ${decisionPrice.toFixed(4)}, SMA(${smaShortPeriod}): ${smaShort.toFixed(4)}, SMA(${smaLongPeriod}): ${smaLong.toFixed(4)}, ATR(${atrPeriod}): ${currentAtr.toFixed(4)}`);
+        console.log(`SMA Analysis (Live): Prev SMA(${smaShortPeriod}): ${smaShortPrev.toFixed(4)}, Prev SMA(${smaLongPeriod}): ${smaLongPrev.toFixed(4)}`);
     }
 
-
-    // Bullish Crossover: Short MA (at previous candle) crossed above Long MA (at previous candle)
+    let tradeType: 'BUY' | 'SELL' | undefined = undefined;
     if (smaShortPrev <= smaLongPrev && smaShort > smaLong) {
+      tradeType = 'BUY';
       if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Bullish Crossover Detected (Live)");
-      return { shouldTrade: true, tradeType: 'BUY', priceAtDecision: decisionPrice };
-    }
-
-    // Bearish Crossover: Short MA crossed below Long MA
-    if (smaShortPrev >= smaLongPrev && smaShort < smaLong) {
+    } else if (smaShortPrev >= smaLongPrev && smaShort < smaLong) {
+      tradeType = 'SELL';
       if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Bearish Crossover Detected (Live)");
-      return { shouldTrade: true, tradeType: 'SELL', priceAtDecision: decisionPrice };
     }
 
-    // if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("No Crossover Detected (Live)");
+    if (tradeType) {
+      const stopLoss = tradeType === 'BUY'
+        ? decisionPrice - (currentAtr * atrMultiplierSL)
+        : decisionPrice + (currentAtr * atrMultiplierSL);
+      const takeProfit = tradeType === 'BUY'
+        ? decisionPrice + (currentAtr * atrMultiplierTP)
+        : decisionPrice - (currentAtr * atrMultiplierTP);
+
+      return {
+        shouldTrade: true,
+        tradeType: tradeType,
+        priceAtDecision: decisionPrice,
+        stopLoss: parseFloat(stopLoss.toFixed(4)), // Ensure precision
+        takeProfit: parseFloat(takeProfit.toFixed(4)) // Ensure precision
+      };
+    }
+
     return { shouldTrade: false, priceAtDecision: decisionPrice };
 
   } catch (error) {
@@ -1233,32 +2071,41 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
   }
 
   // Call analyzeMarketConditions without backtesting parameters for live mode
-  const analysisResult = await analyzeMarketConditions(apiKey, session.strategy_settings?.shortPeriod || 20, session.strategy_settings?.longPeriod || 50);
+  // Pass strategy settings from the session, or use defaults
+  const strategyParams = {
+    smaShortPeriod: session.strategy_settings?.smaShortPeriod || 20,
+    smaLongPeriod: session.strategy_settings?.smaLongPeriod || 50,
+    atrPeriod: session.strategy_settings?.atrPeriod || 14,
+    atrMultiplierSL: session.risk_settings?.atrMultiplierSL || 1.5, // Get from risk_settings
+    atrMultiplierTP: session.risk_settings?.atrMultiplierTP || 3.0,   // Get from risk_settings
+  };
+  const analysisResult = await analyzeMarketConditions(apiKey, strategyParams);
 
   if (analysisResult.shouldTrade && analysisResult.tradeType && analysisResult.priceAtDecision) {
     const tradeType = analysisResult.tradeType;
     const openPrice = analysisResult.priceAtDecision;
-    const lotSize = settings.maxLotSize;
+    const lotSize = settings.maxLotSize; // This is from the general riskSettingsMap (conservative, medium, risky)
 
-    const stopLossDistance = (settings.stopLossPips || 200) / 10; // Default SL pips if not set
-    let stopLossPrice;
-    if (tradeType === 'BUY') {
-      stopLossPrice = openPrice - stopLossDistance;
-    } else { // SELL
-      stopLossPrice = openPrice + stopLossDistance;
+    // Use SL/TP from analysisResult if available (now ATR-based)
+    const stopLossPrice = analysisResult.stopLoss;
+    const takeProfitPrice = analysisResult.takeProfit; // Optional
+
+    if (!stopLossPrice) {
+        console.error(`Session ${session.id}: No stopLossPrice provided by analysisResult. Skipping trade.`);
+        return;
     }
 
-    console.log(`Executing ${tradeType} for session ${session.id}: Price=${openPrice}, SL=${stopLossPrice}, Lot=${lotSize}`);
+    console.log(`Executing ${tradeType} for session ${session.id}: Price=${openPrice.toFixed(4)}, SL=${stopLossPrice.toFixed(4)}, TP=${takeProfitPrice?.toFixed(4) || 'N/A'}, Lot=${lotSize}`);
 
     const executionParams: ExecuteOrderParams = {
       userId: session.user_id,
       tradingAccountId: session.trading_account_id,
-      symbol: 'XAUUSD', // Assuming XAUUSD for now
+      symbol: 'XAUUSD',
       tradeType: tradeType,
       lotSize: lotSize,
       openPrice: openPrice,
-      stopLossPrice: parseFloat(stopLossPrice.toFixed(4)), // Ensure correct precision
-      // takeProfitPrice: undefined, // Add TP logic if desired
+      stopLossPrice: stopLossPrice,
+      takeProfitPrice: takeProfitPrice,
       botSessionId: session.id,
     };
 
@@ -1266,11 +2113,19 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
 
     if (executionResult.success && executionResult.tradeId) {
       console.log(`Trade executed for session ${session.id}, DB Trade ID: ${executionResult.tradeId}, Ticket: ${executionResult.ticketId}`);
+
+      // Notification content update to include SL/TP
+      const notificationMessage =
+        `${tradeType} ${lotSize} ${executionParams.symbol} @ ${openPrice.toFixed(4)} ` +
+        `SL: ${stopLossPrice.toFixed(4)}` +
+        `${takeProfitPrice ? ` TP: ${takeProfitPrice.toFixed(4)}` : ''}` +
+        ` by bot (Session ${session.id})`;
+
       await supabase.from('notifications').insert({
         user_id: session.user_id,
         type: 'bot_trade_executed',
         title: 'Bot Trade Executed (Simulated)',
-        message: `${tradeType} ${lotSize} XAUUSD @ ${openPrice} by bot (Session ${session.id})`
+        message: notificationMessage
       });
       await supabase
         .from('bot_sessions')
