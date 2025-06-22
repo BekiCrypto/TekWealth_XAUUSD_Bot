@@ -3,6 +3,7 @@ import { Bell, Check, Loader2, AlertTriangle, X } from 'lucide-react';
 import { tradingService } from '../services/tradingService';
 import { useAuth } from '../hooks/useAuth';
 import { Database } from '../types/database';
+import { toast } from 'sonner'; // Import toast
 
 type Notification = Database['public']['Tables']['notifications']['Row'];
 
@@ -51,10 +52,38 @@ export function NotificationBell() {
         prev.map(n => n.id === notificationId ? { ...n, is_read: true } : n)
       );
       setUnreadCount(prev => Math.max(0, prev - 1));
+      // toast.success("Notification marked as read."); // Optional: can be a bit noisy for individual marks
     } catch (err: any) {
       console.error("Mark as read error:", err);
-      // Potentially show a small error message per notification
+      toast.error(err.message || "Failed to mark notification as read.");
     }
+  };
+
+  const handleMarkAllAsRead = async () => {
+    const unreadNotifications = notifications.filter(n => !n.is_read);
+    if (unreadNotifications.length === 0) return;
+
+    // To provide better feedback, we can show a loading toast
+    const promise = Promise.all(
+        unreadNotifications.map(n => tradingService.markNotificationAsRead(n.id))
+    );
+
+    toast.promise(promise, {
+        loading: 'Marking all as read...',
+        success: (results) => {
+            // Check if any individual request failed
+            const allSuccessful = results.every(res => !res.error);
+            if (allSuccessful) {
+                fetchNotifications(); // Refetch to get the latest state
+                return 'All notifications marked as read!';
+            } else {
+                // Count successful ones if needed, or just give a mixed message
+                fetchNotifications(); // Still refetch
+                return 'Some notifications could not be marked as read. Please try again.';
+            }
+        },
+        error: 'Failed to mark all notifications as read.',
+    });
   };
 
   const handleToggleDropdown = () => {
@@ -147,12 +176,9 @@ export function NotificationBell() {
             </ul>
           )}
            <div className="p-2 border-t border-gray-700 text-center">
-             {/* Maybe a "Mark all as read" or "View all" button in future */}
              <button
-                onClick={() => {
-                    notifications.filter(n => !n.is_read).forEach(n => handleMarkAsRead(n.id));
-                }}
-                disabled={unreadCount === 0}
+                onClick={handleMarkAllAsRead}
+                disabled={unreadCount === 0 || isLoading}
                 className="text-xs text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
              >
                 Mark all as read ({unreadCount})

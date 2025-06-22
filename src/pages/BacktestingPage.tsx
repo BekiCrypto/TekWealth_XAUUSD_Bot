@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { tradingService, StrategyParams } from '../services/tradingService';
 import { useAuth } from '../hooks/useAuth';
+import { toast } from 'sonner'; // Import toast
 
 // Define interface for the data structure this page will manage
 interface UIPerBacktestParams {
@@ -16,6 +17,8 @@ interface UIPerBacktestParams {
     riskLevel: 'conservative' | 'medium' | 'risky';
     maxLotSize?: number; // This will likely be determined by riskLevel on backend
   };
+  commissionPerLot?: number; // New
+  slippagePoints?: number;   // New
 }
 
 // Interface for the report structure returned by the backend
@@ -66,6 +69,8 @@ const BacktestingPage: React.FC = () => {
       breakoutLookbackPeriod: 50, atrSpikeMultiplier: 1.5,
     },
     riskSettings: { riskLevel: 'conservative' },
+    commissionPerLot: 0, // Default commission
+    slippagePoints: 0,   // Default slippage
   });
   const [loading, setLoading] = useState<boolean>(false);
   const [currentReport, setCurrentReport] = useState<BacktestReport | null>(null);
@@ -100,10 +105,17 @@ const BacktestingPage: React.FC = () => {
         };
         const response = await tradingService.fetchHistoricalData(historicalDataParams);
         if (response.error) throw response.error;
-        alert(`Historical data fetch status: ${response.data?.message || (response.data?.success ? 'Success' : 'Failed/No data')}`);
+
+        const message = response.data?.message || (response.data?.success ? 'Successfully fetched/updated historical data.' : 'Historical data operation completed, but status unclear or no new data.');
+        if (response.data?.success || response.data?.inserted > 0) {
+            toast.success(message);
+        } else {
+            toast.info(message); // Use info for neutral messages
+        }
     } catch (err:any) {
-        setError(err.message || 'Failed to fetch historical data');
-        alert(`Error fetching historical data: ${err.message}`);
+        const errorMessage = err.message || 'Failed to fetch historical data';
+        setError(errorMessage);
+        toast.error(`Error fetching historical data: ${errorMessage}`);
     }
     finally { setLoading(false); }
   };
@@ -124,11 +136,12 @@ const BacktestingPage: React.FC = () => {
         endDate: params.endDate,
         strategySelectionMode: params.strategySelectionMode,
         strategyParams: params.strategyParams as StrategyParams, // Ensure all defaults are covered if not in UI
-        riskSettings: { // Pass only what backend's runBacktestAction expects for riskSettings
+        riskSettings: {
             riskLevel: params.riskSettings.riskLevel,
-            // maxLotSize is derived by backend from riskLevel, but can be an override
             ...(params.riskSettings.maxLotSize && { maxLotSize: params.riskSettings.maxLotSize })
-        }
+        },
+        commissionPerLot: params.commissionPerLot, // Add commission
+        slippagePoints: params.slippagePoints     // Add slippage
       };
       const response = await tradingService.runBacktest(runParamsPayload);
       if (response.error) throw response.error;
@@ -272,6 +285,14 @@ const BacktestingPage: React.FC = () => {
                 </select>
             </div>
             {/* <div><label className={labelStyle}>Max Lot Size (Override): <input type="number" step="0.01" name="maxLotSize" value={params.riskSettings.maxLotSize ?? ''} onChange={handleParamChange} className={inputStyle} /></label></div> */}
+            <div className="mt-2">
+                <label className={labelStyle}>Commission Per Lot (e.g., 0.7 for $0.70): </label>
+                <input type="number" step="0.01" name="commissionPerLot" value={params.commissionPerLot ?? 0} onChange={handleParamChange} className={inputStyle + " w-full"} />
+            </div>
+            <div className="mt-2">
+                <label className={labelStyle}>Slippage Points (e.g., 0.2 for XAUUSD): </label>
+                <input type="number" step="0.01" name="slippagePoints" value={params.slippagePoints ?? 0} onChange={handleParamChange} className={inputStyle + " w-full"} />
+            </div>
         </fieldset>
 
         {renderStrategyParamsInputs()}

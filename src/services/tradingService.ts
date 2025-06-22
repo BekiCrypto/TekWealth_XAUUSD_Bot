@@ -66,24 +66,84 @@ export class TradingService {
     platform: 'MT4' | 'MT5';
     serverName: string;
     loginId: string;
-    password: string;
+    password: string; // This is the plain text password from the user
     userId: string;
+    accountId?: string; // Optional: for updating an existing account
   }) {
-    const encryptedPassword = await this.encryptPassword(accountData.password);
-    const { data, error } = await supabase
-      .from('trading_accounts')
-      .insert({
-        user_id: accountData.userId,
-        platform: accountData.platform,
-        server_name: accountData.serverName,
-        login_id: accountData.loginId,
-        password_encrypted: encryptedPassword,
-      })
-      .select()
-      .single();
-    if (!error && data) { await this.testConnection(data.id); }
-    return { data, error };
+    try {
+      // The backend will handle encryption using Supabase Vault.
+      // Send the plain text password to the backend action.
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {
+          action: 'upsert_trading_account_action',
+          data: {
+            userId: accountData.userId,
+            accountId: accountData.accountId, // Pass if updating
+            platform: accountData.platform,
+            serverName: accountData.serverName,
+            loginId: accountData.loginId,
+            passwordPlainText: accountData.password, // Key name change for clarity
+            // isActive: true, // Defaulted in backend if not provided
+          },
+        },
+      });
+
+      if (error) throw error;
+
+      // The 'data' returned from the function should be the saved account details (excluding password_encrypted)
+      // The old this.testConnection might not be relevant or might need adjustment
+      // if (!error && data) { await this.testConnection(data.id); } // data.id might not exist if function returns error structure
+      if (data && data.id) { // Assuming function returns the account object with its ID
+         // console.log("Trading account upserted successfully:", data);
+         // await this.testConnection(data.id); // testConnection is a placeholder, consider removing or implementing properly
+      } else if (data && data.error) { // If the function itself returns an error object in its data field
+        throw new Error(data.error);
+      } else if (!data) {
+        throw new Error("No data returned from upsert_trading_account_action");
+      }
+
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error adding/updating trading account:', error);
+      return { data: null, error };
+    }
   }
+
+  // Method to update an existing trading account (could be merged with addTradingAccount if accountId is always passed)
+  async updateTradingAccount(accountId: string, userId: string, updateData: {
+    platform?: 'MT4' | 'MT5';
+    serverName?: string;
+    loginId?: string;
+    password?: string; // Plain text password if updating
+    isActive?: boolean;
+  }) {
+     const payload: any = {
+        action: 'upsert_trading_account_action',
+        data: {
+            userId,
+            accountId,
+            platform: updateData.platform,
+            serverName: updateData.serverName,
+            loginId: updateData.loginId,
+            isActive: updateData.isActive,
+        }
+     };
+     if (updateData.password) {
+         payload.data.passwordPlainText = updateData.password;
+     }
+
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', payload);
+      if (error) throw error;
+      if (data && data.error) throw new Error(data.error);
+      if (!data) throw new Error("No data returned from update_trading_account_action");
+      return { data, error: null };
+    } catch (error: any) {
+      console.error(`Error updating trading account ${accountId}:`, error);
+      return { data: null, error };
+    }
+  }
+
 
   async getTradingAccounts(userId: string) {
     return supabase.from('trading_accounts').select('*').eq('user_id', userId).eq('is_active', true);
@@ -282,10 +342,12 @@ export class TradingService {
     endDate: string;
     strategySelectionMode: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'BREAKOUT_ONLY';
     strategyParams: StrategyParams;
-    riskSettings: { // Keep general risk settings separate if needed by backend
+    riskSettings: {
         riskLevel?: 'conservative' | 'medium' | 'risky';
-        maxLotSize?: number; // This might be derived from riskLevel on backend too
+        maxLotSize?: number;
     };
+    commissionPerLot?: number; // New
+    slippagePoints?: number;   // New
   }) {
     try {
       const { data, error } = await supabase.functions.invoke('trading-engine', {
@@ -331,10 +393,6 @@ export class TradingService {
   }
 
   // --- Private Methods ---
-  private async encryptPassword(password: string): Promise<string> {
-    console.warn("encryptPassword method is a placeholder and should not be used for production credentials.");
-    return `placeholder-for-${password}`;
-  }
   private async testConnection(_accountId: string): Promise<boolean> {
     await new Promise(resolve => setTimeout(resolve, 1000));
     return Math.random() > 0.1;
@@ -362,6 +420,35 @@ export class TradingService {
       const price = await this.getCurrentPrice();
       if (price !== null) { this.priceCallbacks.forEach(callback => callback(price)); }
     }, 15000);
+  }
+
+  // --- Admin Service Methods ---
+  async adminGetEnvVariablesStatus(): Promise<{ data: Array<{name: string, status: string}> | null; error: any }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'admin_get_env_variables_status' },
+      });
+      if (error) throw error;
+      if (data && data.error) throw new Error(data.error); // Handle errors returned in the data payload
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error fetching ENV variable statuses:', error);
+      return { data: null, error };
+    }
+  }
+
+  async adminListUsersOverview(): Promise<{ data: Array<{id: string, email?: string, created_at: string, last_sign_in_at?: string}> | null; error: any }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'admin_list_users_overview' },
+      });
+      if (error) throw error;
+      if (data && data.error) throw new Error(data.error); // Handle errors returned in the data payload
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error listing users overview:', error);
+      return { data: null, error };
+    }
   }
 }
 

@@ -6,6 +6,7 @@ import { UserDashboard } from './pages/UserDashboard';
 import { TradingBot } from './pages/TradingBot';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
+import { Toaster } from 'sonner'; // Import Toaster
 
 function App() {
   const [currentPage, setCurrentPage] = useState('landing');
@@ -49,6 +50,7 @@ function App() {
       <main className="ml-64 min-h-screen">
         {renderPage()}
       </main>
+      <Toaster richColors position="top-right" /> {/* Add Toaster component */}
     </div>
   );
 }

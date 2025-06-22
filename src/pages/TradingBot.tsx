@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { tradingService, StrategyParams, BotSession as BotSessionType } from '../services/tradingService';
 import { useAuth } from '../hooks/useAuth';
 import { Bot, Play, Pause, Settings, AlertTriangle, CheckCircle, TrendingUp, Shield, Zap, PlusCircle, XCircle, RefreshCw, Activity } from 'lucide-react';
+import { toast } from 'sonner'; // Import toast
 
 // Define a more specific type for the form state within this component
 interface NewSessionConfig {
@@ -155,10 +156,11 @@ export function TradingBot() {
       if (response.error) throw response.error;
       setShowConfigModal(false);
       fetchUserTradingData();
-      alert("Bot session started successfully!");
+      toast.success("Bot session started successfully!");
     } catch (err: any) {
-      setError(err.message || "Failed to start bot session.");
-      alert(`Error starting bot: ${err.message}`);
+      const errorMessage = err.message || "Failed to start bot session.";
+      setError(errorMessage);
+      toast.error(`Error starting bot: ${errorMessage}`);
     } finally {
       setIsStartingSession(false);
     }
@@ -170,10 +172,11 @@ export function TradingBot() {
       const response = await tradingService.stopBot(sessionId);
       if (response.error) throw response.error;
       fetchUserTradingData();
-      alert("Bot session stopped successfully!");
+      toast.success("Bot session stopped successfully!");
     } catch (err: any) {
-      setError(err.message || "Failed to stop bot session.");
-      alert(`Error stopping bot: ${err.message}`);
+      const errorMessage = err.message || "Failed to stop bot session.";
+      setError(errorMessage);
+      toast.error(`Error stopping bot: ${errorMessage}`);
     } finally {
       setIsStoppingSession(null);
     }

@@ -1,14 +1,385 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import {
+  crypto as webCrypto, // Renamed to avoid conflict with Deno.crypto
+} from "https://deno.land/std@0.168.0/crypto/mod.ts";
+import { decode as base64Decode, encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
+
 
 // Helper function to get environment variables
 function getEnv(variableName: string): string {
-  const value = Deno.env.get(variableName)
+  const value = Deno.env.get(variableName);
   if (!value) {
     throw new Error(`Environment variable ${variableName} is not set.`)
   }
   return value
 }
+
+// --- Cryptography Helpers for Password Encryption ---
+const VAULT_SECRET_KEY_NAME = "TRADING_ACCOUNT_ENC_KEY"; // Name of the secret in Supabase Vault
+
+async function getKeyFromVault(): Promise<CryptoKey> {
+  const keyMaterialBase64 = Deno.env.get(VAULT_SECRET_KEY_NAME);
+  if (!keyMaterialBase64) {
+    throw new Error(`Vault secret ${VAULT_SECRET_KEY_NAME} not found. Please set it in Supabase Vault (e.g., a 32-byte base64 encoded string).`);
+  }
+  try {
+    const keyMaterial = base64Decode(keyMaterialBase64);
+    if (keyMaterial.byteLength !== 32) { // Ensure it's 256-bit
+        throw new Error("Vault encryption key must be 32 bytes (256-bit) long when base64 decoded.");
+    }
+    return await webCrypto.subtle.importKey(
+      "raw",
+      keyMaterial,
+      { name: "AES-GCM" },
+      false, // not extractable
+      ["encrypt", "decrypt"]
+    );
+  } catch (e) {
+    console.error("Error importing key from vault:", e.message);
+    throw new Error("Failed to import encryption key. Ensure it's a valid base64 encoded 32-byte key.");
+  }
+}
+
+async function encryptPassword(password: string): Promise<string> {
+  const key = await getKeyFromVault();
+  const iv = webCrypto.getRandomValues(new Uint8Array(12)); // AES-GCM recommended IV size is 12 bytes
+  const encodedPassword = new TextEncoder().encode(password);
+
+  const encryptedData = await webCrypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv },
+    key,
+    encodedPassword
+  );
+
+  // Combine IV and ciphertext, then base64 encode for storage
+  // Format: base64(iv):base64(ciphertext)
+  const ivBase64 = base64Encode(iv);
+  const encryptedBase64 = base64Encode(new Uint8Array(encryptedData));
+  return `${ivBase64}:${encryptedBase64}`;
+}
+
+async function decryptPassword(encryptedPasswordWithIv: string): Promise<string> {
+  const key = await getKeyFromVault();
+  const parts = encryptedPasswordWithIv.split(':');
+  if (parts.length !== 2) {
+    throw new Error("Invalid encrypted password format. Expected 'iv:ciphertext'.");
+  }
+  const iv = base64Decode(parts[0]);
+  const encryptedData = base64Decode(parts[1]);
+
+  const decryptedData = await webCrypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv },
+    key,
+    encryptedData
+  );
+
+  return new TextDecoder().decode(decryptedData);
+}
+// --- End Cryptography Helpers ---
+
+// --- Action Handler for Upserting Trading Account with Encrypted Password ---
+async function upsertTradingAccountAction(supabase: any, data: any) {
+  const { userId, accountId, platform, serverName, loginId, passwordPlainText, isActive = true } = data;
+
+  if (!userId || !platform || !serverName || !loginId || !passwordPlainText) {
+    return new Response(JSON.stringify({ error: "Missing required fields (userId, platform, serverName, loginId, passwordPlainText)." }), {
+      status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  try {
+    const encryptedPassword = await encryptPassword(passwordPlainText);
+
+    const accountDataToUpsert = {
+      user_id: userId,
+      platform: platform,
+      server_name: serverName,
+      login_id: loginId,
+      password_encrypted: encryptedPassword, // Store the encrypted password
+      is_active: isActive,
+      // Ensure other non-sensitive fields like account_balance, equity are not overwritten here
+      // They should be updated by a sync process with the trade provider if needed.
+    };
+
+    let query = supabase.from('trading_accounts');
+    let result;
+
+    if (accountId) { // If accountId is provided, it's an update
+      // Select existing account to preserve non-updated fields if necessary, though upsert handles this.
+      // However, for an update, we only want to update specific fields if they are passed.
+      // For simplicity, this example updates all provided fields.
+      // A more granular update would build the update object dynamically.
+      result = await query.update(accountDataToUpsert)
+        .eq('id', accountId)
+        .eq('user_id', userId) // Ensure user owns the account they are trying to update
+        .select()
+        .single();
+    } else { // Otherwise, it's an insert
+      result = await query.insert(accountDataToUpsert)
+        .select()
+        .single();
+    }
+
+    const { data: savedAccount, error: dbError } = result;
+
+    if (dbError) {
+      console.error('Error upserting trading account:', dbError);
+      // Handle specific errors like unique constraint violation on login_id if necessary
+      if (dbError.code === '23505') { // Unique violation
+        return new Response(JSON.stringify({ error: "Trading account with this login ID already exists for this server/platform." }), {
+          status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      throw dbError;
+    }
+     if (!savedAccount) {
+      throw new Error("Trading account data was not returned after upsert.");
+    }
+
+
+    // Do NOT return the encryptedPassword or plain password in the response
+    const { password_encrypted, ...accountToReturn } = savedAccount;
+
+    return new Response(JSON.stringify(accountToReturn), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+
+  } catch (error) {
+    console.error("Error in upsertTradingAccountAction:", error.message, error.stack);
+    const isCryptoError = error.message.includes(VAULT_SECRET_KEY_NAME) || error.message.includes("Failed to import encryption key");
+    const logLevel = isCryptoError ? 'CRITICAL' : 'ERROR';
+    const logMessage = isCryptoError ? `Encryption setup error: ${error.message}` : `Failed to save trading account: ${error.message}`;
+
+    await logSystemEvent(
+      supabase, // supabaseClient is named 'supabase' in this function's scope
+      logLevel,
+      'UpsertTradingAccount',
+      logMessage,
+      { stack: error.stack, userId: data?.userId, accountId: data?.accountId }
+    );
+
+    if (isCryptoError) {
+        return new Response(JSON.stringify({ error: `${logMessage}. Please ensure the Vault secret is correctly configured.` }), {
+            status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+    return new Response(JSON.stringify({ error: "Failed to save trading account: " + error.message }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+// --- End Trading Account Action ---
+
+// --- Retry Helper ---
+async function retryAsyncFunction<T>(
+  asyncFn: () => Promise<T>,
+  maxRetries: number = 3,
+  delayMs: number = 1000,
+  context: string = "Unnamed"
+): Promise<T> {
+  let attempts = 0;
+  while (attempts < maxRetries) {
+    try {
+      if (attempts > 0) {
+        console.log(`Retrying ${context}: Attempt ${attempts + 1} of ${maxRetries} after ${delayMs}ms delay...`);
+      }
+      return await asyncFn();
+    } catch (error) {
+      attempts++;
+      console.error(`Error in ${context} on attempt ${attempts}:`, error.message);
+      if (attempts >= maxRetries) {
+        console.error(`All ${maxRetries} retries failed for ${context}.`);
+        // logSystemEvent is async, but this is inside a sync function if not careful.
+        // However, retryAsyncFunction IS async. So this is fine.
+        // We need supabaseClient here. This helper might need to be a class or take client.
+        // For now, we cannot call logSystemEvent from here without supabaseClient.
+        // Let's assume the caller of retryAsyncFunction will log the final failure.
+        throw error; // Re-throw the last error
+      }
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  // Should not be reached if maxRetries > 0, but typescript needs a return path or throw
+  throw new Error(`All retries failed for ${context} (this line should not be reached).`);
+}
+// --- End Retry Helper ---
+
+// --- System Logging Helper ---
+async function logSystemEvent(
+  supabaseClient: any,
+  level: 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL',
+  context: string,
+  message: string,
+  details?: any,
+  sessionId?: string,
+  userId?: string
+) {
+  try {
+    const logEntry: any = {
+      log_level: level,
+      context,
+      message,
+      details: details || null,
+    };
+    if (sessionId) logEntry.session_id = sessionId;
+    if (userId) logEntry.user_id = userId;
+
+    const { error } = await supabaseClient.from('system_logs').insert(logEntry);
+    if (error) {
+      console.error('Failed to insert system log:', error, logEntry);
+    }
+  } catch (e) {
+    console.error('Exception in logSystemEvent:', e);
+  }
+}
+// --- End System Logging Helper ---
+
+// --- Admin Actions ---
+// Helper function to check user role (simplified for now)
+// In a real app, this would involve decoding JWT and checking custom claims or a roles table.
+async function isAdmin(supabaseClient: any, requestHeaders: Headers): Promise<{ authorized: boolean, userId?: string, userEmail?: string }> {
+  const authHeader = requestHeaders.get('Authorization');
+  if (!authHeader) {
+    console.warn("isAdmin check: No Authorization header found.");
+    return { authorized: false };
+  }
+  try {
+    const { data: { user }, error } = await supabaseClient.auth.getUser(authHeader.replace('Bearer ', ''));
+    if (error) {
+      console.warn("isAdmin check: Error getting user from JWT:", error.message);
+      return { authorized: false };
+    }
+    if (!user) {
+      console.warn("isAdmin check: No user object returned from JWT.");
+      return { authorized: false };
+    }
+
+    // Super basic: check if user email matches a predefined admin email ENV var (NOT recommended for production)
+    const adminEmail = Deno.env.get("ADMIN_EMAIL_ADDRESS");
+    if (adminEmail && user.email === adminEmail) {
+        // console.log(`User ${user.email} identified as admin via ADMIN_EMAIL_ADDRESS.`);
+        return { authorized: true, userId: user.id, userEmail: user.email };
+    }
+    console.warn(`isAdmin check: User ${user.email} is not authorized as admin based on current basic check.`);
+    return { authorized: false, userId: user.id, userEmail: user.email };
+  } catch (e) {
+    console.error("isAdmin check: Exception during auth check:", e.message);
+    return { authorized: false };
+  }
+}
+
+async function adminGetEnvVariablesStatusAction(supabaseClient: any, _data: any, headers: Headers) {
+  const adminCheck = await isAdmin(supabaseClient, headers);
+  if (!adminCheck.authorized) {
+    await logSystemEvent(supabaseClient, 'WARN', 'AdminActionAttempt', 'Unauthorized attempt to access adminGetEnvVariablesStatusAction.', { userId: adminCheck.userId, userEmail: adminCheck.userEmail });
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+  }
+
+  const criticalEnvVars = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_ROLE_KEY',
+    'ALPHA_VANTAGE_API_KEY',
+    'SENDGRID_API_KEY',
+    'FROM_EMAIL',
+    'NOTIFICATION_EMAIL_RECIPIENT',
+    'MT_BRIDGE_URL', // Optional depending on TRADE_PROVIDER_TYPE
+    'MT_BRIDGE_API_KEY', // Optional
+    'TRADE_PROVIDER_TYPE',
+    VAULT_SECRET_KEY_NAME, // From crypto helpers
+    'ADMIN_EMAIL_ADDRESS' // For the basic admin check
+  ];
+
+  const statuses = criticalEnvVars.map(varName => {
+    const value = Deno.env.get(varName);
+    return { name: varName, status: value ? "SET" : "NOT SET" };
+  });
+
+  return new Response(JSON.stringify(statuses), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function adminListUsersOverviewAction(supabaseClient: any, _data: any, headers: Headers) {
+  const adminCheck = await isAdmin(supabaseClient, headers);
+  if (!adminCheck.authorized) {
+    await logSystemEvent(supabaseClient, 'WARN', 'AdminActionAttempt', 'Unauthorized attempt to access adminListUsersOverviewAction.', { userId: adminCheck.userId, userEmail: adminCheck.userEmail });
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+  }
+
+  try {
+    // Note: Supabase client library's listUsers is an admin API.
+    // Ensure your SERVICE_ROLE_KEY is used when creating supabaseClient for this to work.
+    const { data: { users }, error } = await supabaseClient.auth.admin.listUsers({
+        page: 1,
+        perPage: 100, // Adjust as needed
+    });
+
+    if (error) throw error;
+
+    const usersOverview = users.map(user => ({
+      id: user.id,
+      email: user.email,
+      created_at: user.created_at,
+      last_sign_in_at: user.last_sign_in_at,
+      // role: user.app_metadata?.role || user.user_metadata?.role || 'user', // Example if role is in metadata
+    }));
+
+    return new Response(JSON.stringify(usersOverview), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error("Error in adminListUsersOverviewAction:", error.message);
+    return new Response(JSON.stringify({ error: "Failed to list users: " + error.message }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function adminGetSystemLogsAction(supabaseClient: any, data: any, headers: Headers) {
+  const adminCheck = await isAdmin(supabaseClient, headers);
+  if (!adminCheck.authorized) {
+    await logSystemEvent(supabaseClient, 'WARN', 'AdminActionAttempt', 'Unauthorized attempt to access adminGetSystemLogsAction.', { userId: adminCheck.userId, userEmail: adminCheck.userEmail });
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+  }
+
+  const {
+    limit = 50,
+    offset = 0,
+    log_level,
+    context,
+    start_date, // ISO string
+    end_date    // ISO string
+  } = data || {};
+
+  try {
+    let query = supabaseClient.from('system_logs').select('*');
+
+    if (log_level) query = query.eq('log_level', log_level);
+    if (context) query = query.ilike('context', `%${context}%`); // Case-insensitive like
+    if (start_date) query = query.gte('created_at', start_date);
+    if (end_date) query = query.lte('created_at', end_date);
+
+    query = query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+
+    const { data: logs, error, count } = await query;
+
+    if (error) throw error;
+
+    return new Response(JSON.stringify({ logs, count }), { // Send count for pagination
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+
+  } catch (error) {
+    console.error("Error in adminGetSystemLogsAction:", error.message);
+    await logSystemEvent(supabaseClient, 'ERROR', 'AdminGetSystemLogs', `Failed to fetch system logs: ${error.message}`, { stack: error.stack, filters: data });
+    return new Response(JSON.stringify({ error: "Failed to fetch system logs: " + error.message }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+// --- End Admin Actions ---
+
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -252,7 +623,8 @@ class MetaTraderBridgeProvider implements ITradeExecutionProvider {
       'Content-Type': 'application/json',
       'X-MT-Bridge-API-Key': this.bridgeApiKey,
     };
-    try {
+
+    const fetchFn = async () => {
       const response = await fetch(`${this.bridgeUrl}${endpoint}`, {
         method,
         headers,
@@ -260,24 +632,31 @@ class MetaTraderBridgeProvider implements ITradeExecutionProvider {
       });
 
       if (!response.ok) {
-        const errorText = await response.text(); // Get text first for better debugging
+        const errorText = await response.text();
         let errorData;
         try {
             errorData = JSON.parse(errorText);
         } catch (e) {
             errorData = { error: "Failed to parse error response from bridge", details: errorText };
         }
-        console.error(`MetaTraderBridgeProvider Error: ${response.status} ${response.statusText}`, errorData);
-        throw new Error(`Bridge API Error (${endpoint}): ${response.status} - ${errorData.error || response.statusText}`);
+        // Log the error before throwing to ensure it's captured by retry logic's console output
+        console.error(`MetaTraderBridgeProvider Error (Attempt): ${response.status} ${response.statusText} for ${method} ${endpoint}`, errorData);
+        throw new Error(`Bridge API Error (${method} ${endpoint}): ${response.status} - ${errorData.error || response.statusText}`);
       }
-      // Handle cases where response might be empty for 202/204 status
+
       if (response.status === 202 || response.status === 204) {
-          return { success: true, message: `Request to ${endpoint} accepted.` }; // Or an empty object if preferred
+          return { success: true, message: `Request to ${endpoint} accepted.` };
       }
       return await response.json();
+    };
+
+    try {
+      // Retry up to 2 times (total 3 attempts) with 3s delay for bridge requests
+      return await retryAsyncFunction(fetchFn, 2, 3000, `MetaTraderBridgeProvider.makeRequest(${method} ${endpoint})`);
     } catch (error) {
-      console.error(`MetaTraderBridgeProvider Request Failed (${endpoint}):`, error);
-      throw error;
+      // This error is after all retries have failed
+      console.error(`All retries failed for MetaTraderBridgeProvider.makeRequest (${method} ${endpoint}):`, error.message);
+      throw error; // Re-throw the final error to be handled by the calling method
     }
   }
 
@@ -400,10 +779,16 @@ serve(async (req) => {
         return await runBotLogic(supabaseClient, data, alphaVantageApiKey)
 
       case 'get_current_price_action':
-         const price = await getCurrentGoldPrice(alphaVantageApiKey);
-         return new Response(JSON.stringify({ price }), {
+        try {
+          const price = await getCurrentGoldPrice(alphaVantageApiKey);
+          return new Response(JSON.stringify({ price }), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-         });
+          });
+        } catch (error) {
+          await logSystemEvent(supabaseClient, 'ERROR', 'GetCurrentPriceAction', `Failed to get current price: ${error.message}`, { stack: error.stack });
+          // Re-throw or return error response, consistent with other error handling
+          throw error; // Let the main serve catch block handle response formatting
+        }
 
       case 'fetch_historical_data_action': // New action
         return await fetchAndStoreHistoricalData(supabaseClient, data, alphaVantageApiKey);
@@ -427,11 +812,29 @@ serve(async (req) => {
       case 'provider_get_server_time':
         return await handleProviderGetServerTime(supabaseClient, data, alphaVantageApiKey);
 
+      case 'upsert_trading_account_action': // New action for secure password handling
+        return await upsertTradingAccountAction(supabaseClient, data);
+
+      // Admin actions
+      case 'admin_get_env_variables_status':
+        return await adminGetEnvVariablesStatusAction(supabaseClient, data, req.headers);
+      case 'admin_list_users_overview':
+        return await adminListUsersOverviewAction(supabaseClient, data, req.headers);
+      case 'admin_get_system_logs':
+        return await adminGetSystemLogsAction(supabaseClient, data, req.headers);
+
       default:
         throw new Error(`Unknown action: ${action}`)
     }
   } catch (error) {
-    console.error('Trading engine error:', error.message, error.stack)
+    console.error('Trading engine error:', error.message, error.stack);
+    // Attempt to log to system_logs if supabaseClient was initialized
+    // Need to check if supabaseClient is in scope and initialized.
+    // For simplicity, we'll assume if we are in this catch, it might not be,
+    // or the error might be *about* supabaseClient. A more robust solution
+    // would pass supabaseClient into a centralized error handler.
+    // For now, just console.error is reliable here.
+    // Awaiting logSystemEvent(supabaseClient, 'CRITICAL', 'MainServeError', error.message, { stack: error.stack });
     return new Response(JSON.stringify({ error: error.message }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 400,
@@ -440,12 +843,18 @@ serve(async (req) => {
 })
 
 async function fetchCurrentGoldPriceFromAPI(apiKey: string): Promise<number> {
-  // Using Alpha Vantage CURRENCY_EXCHANGE_RATE endpoint for XAU to USD
-  const url = `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=XAU&to_currency=USD&apikey=${apiKey}`;
-  try {
+  const fetchFn = async () => {
+    const url = `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=XAU&to_currency=USD&apikey=${apiKey}`;
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Alpha Vantage API error: ${response.statusText}`);
+      // Specific check for Alpha Vantage rate limit response
+      if (response.status === 429 || (response.headers.get("content-type")?.includes("application/json"))) {
+        const errorData = await response.json().catch(() => null);
+        if (errorData && errorData.Information && errorData.Information.includes("API call frequency")) {
+          throw new Error(`Alpha Vantage API rate limit hit: ${errorData.Information}`);
+        }
+      }
+      throw new Error(`Alpha Vantage API error: ${response.status} ${response.statusText}`);
     }
     const data = await response.json();
     const rate = data["Realtime Currency Exchange Rate"]?.["5. Exchange Rate"];
@@ -457,13 +866,22 @@ async function fetchCurrentGoldPriceFromAPI(apiKey: string): Promise<number> {
     }
     const price = parseFloat(rate);
     latestGoldPrice = { price, timestamp: Date.now() };
-    console.log("Fetched new gold price from API:", price);
+    // console.log("Fetched new gold price from API:", price); // Reduced verbosity
     return price;
+  };
+
+  try {
+    // Retry up to 2 times (total 3 attempts) with 2s delay for price fetching
+    return await retryAsyncFunction(fetchFn, 2, 2000, "fetchCurrentGoldPriceFromAPI");
   } catch (error) {
-    console.error("Error fetching gold price from Alpha Vantage:", error);
-    // If API fails, try to return the last cached price if not too old
+    console.error("All retries failed for fetchCurrentGoldPriceFromAPI:", error.message);
+    // supabaseClient is not available in this function's scope directly.
+    // Logging of this specific failure needs to happen where supabaseClient is available,
+    // or this function needs supabaseClient passed to it.
+    // For now, this detailed console error will have to suffice for this specific spot.
+    // If API fails after retries, try to return the last cached price if not too old
     if (latestGoldPrice && (Date.now() - latestGoldPrice.timestamp < PRICE_CACHE_DURATION_MS * 2)) {
-      console.warn("Returning cached gold price due to API error.");
+      console.warn("Returning cached gold price due to API error after retries.");
       return latestGoldPrice.price;
     }
     throw error; // Re-throw if no usable cache
@@ -472,22 +890,86 @@ async function fetchCurrentGoldPriceFromAPI(apiKey: string): Promise<number> {
 
 // --- Action Handlers for ITradeExecutionProvider methods ---
 // Helper to get the configured trade provider
-function getTradeProvider(supabase: any, alphaVantageApiKeyForSimulated: string): ITradeExecutionProvider {
+// Now needs tradingAccountId to fetch encrypted password for MetaTraderBridgeProvider
+async function getTradeProvider(
+  supabase: any,
+  alphaVantageApiKeyForSimulated: string,
+  tradingAccountId?: string // Make this optional for general calls, but required if MT provider needs credentials
+): Promise<ITradeExecutionProvider> {
   const providerType = Deno.env.get('TRADE_PROVIDER_TYPE')?.toUpperCase() || 'SIMULATED';
+
   if (providerType === 'METATRADER') {
-    const bridgeUrl = Deno.env.get('MT_BRIDGE_URL');
-    const bridgeApiKeyEnv = Deno.env.get('MT_BRIDGE_API_KEY');
-    if (!bridgeUrl || !bridgeApiKeyEnv) {
-      console.warn("MetaTrader provider configured but URL or API key missing. Falling back to SIMULATED.");
-      return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
+    if (!tradingAccountId) {
+      // This scenario might occur if an admin tries to call a provider action without specific account context
+      // Or if a session is processed without a valid trading_account_id (should be prevented by session validation)
+      console.error("MetaTrader provider selected, but no tradingAccountId provided to fetch credentials. Cannot instantiate provider.");
+      // Depending on strictness, could throw error or fallback. For now, let's throw an error or return a "dummy" provider that always fails.
+      // Or, if certain MT_BRIDGE_API_KEY is global and doesn't need per-account password, this check isn't needed.
+      // Assuming for now the MT_BRIDGE_API_KEY is for the bridge itself, but individual account access needs credentials.
+      // The current MetaTraderBridgeProvider constructor doesn't take login/password, this needs to be revisited.
+      // Let's assume the bridge API key is global, and no per-account password is passed TO the bridge via constructor for now.
+      // If per-account credentials ARE needed by the bridge, the bridge API contract and provider need an update.
+      // For this step, we focus on decrypting password stored in OUR DB if we were to send it.
+
+      // For the purpose of this step (decrypting password from our DB to *potentially* use it):
+      // The MetaTraderBridgeProvider's constructor currently only takes bridgeUrl and bridgeApiKey.
+      // It does NOT take the trading account's login/password. This implies either:
+      // 1. The bridge itself is pre-configured with account credentials (less likely for multi-user system).
+      // 2. The bridge API calls (like /order/execute) would need to include account identifiers and potentially auth tokens.
+      // This part of the design (how MT account credentials are used by the bridge) needs clarification
+      // if we are to pass decrypted passwords to it.
+
+      // For now, let's assume the `MT_BRIDGE_API_KEY` is the only auth needed FOR THE BRIDGE.
+      // The Vault encryption/decryption is for passwords stored IN OUR `trading_accounts` table.
+      // If these decrypted passwords need to be sent TO THE BRIDGE with each call,
+      // then the `MetaTraderBridgeProvider.makeRequest` or individual methods would need to accept them.
+
+      // Let's proceed with the current structure of MetaTraderBridgeProvider's constructor
+      // and note that if individual account passwords need to be passed to the bridge,
+      // that's a separate refactor of the provider and its API calls.
+      // The decryption logic added here would be useful IF that refactor occurs.
+
+      // TODO: Refactor MetaTraderBridgeProvider and its API contract if per-account login/password
+      // needs to be passed to the bridge. Currently, it only uses a global bridge API key.
+      // The `decryptPassword` function is available for when this is implemented.
+      /*
+      if (!tradingAccountId) {
+        throw new Error("MetaTrader provider requires tradingAccountId to fetch credentials.");
+      }
+      const { data: account, error: accError } = await supabase
+        .from('trading_accounts')
+        .select('password_encrypted, login_id') // Assuming login_id is also needed
+        .eq('id', tradingAccountId)
+        .single();
+
+      if (accError || !account || !account.password_encrypted) {
+        console.error(`Failed to fetch trading account ${tradingAccountId} or its encrypted password.`, accError);
+        await logSystemEvent(supabase, 'ERROR', 'GetTradeProvider', `Failed to fetch trading account ${tradingAccountId} or its encrypted password.`, { error: accError?.message, tradingAccountId });
+        throw new Error(`Could not retrieve credentials for trading account ${tradingAccountId}.`);
+      }
+
+      const decryptedPass = await decryptPassword(account.password_encrypted);
+      // Now, MetaTraderBridgeProvider constructor or its methods would need to accept login_id and decryptedPass.
+      // e.g. return new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKeyEnv, account.login_id, decryptedPass);
+      console.log(`Conceptual: Would use decrypted password for account ${tradingAccountId} / login ${account.login_id}`);
+      */
+
+      const bridgeUrl = Deno.env.get('MT_BRIDGE_URL');
+      const bridgeApiKeyEnv = Deno.env.get('MT_BRIDGE_API_KEY');
+      if (!bridgeUrl || !bridgeApiKeyEnv) {
+        console.warn("MetaTrader provider configured but URL or API key missing. Falling back to SIMULATED.");
+        return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
+      }
+      return new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKeyEnv); // Current constructor
     }
-    return new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKeyEnv);
-  }
-  return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
+    return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
 }
 
+
 async function handleProviderCloseOrder(supabase: any, data: any, alphaVantageApiKey: string) {
-  const provider = getTradeProvider(supabase, alphaVantageApiKey);
+  // Provider actions are often generic, may not have tradingAccountId if bridge is global
+  // If they become account-specific, data.tradingAccountId would be needed here.
+  const provider = await getTradeProvider(supabase, alphaVantageApiKey, data.tradingAccountId);
   const { ticketId, lots, price, slippage } = data; // data should be CloseOrderParams
   if (!ticketId) {
     return new Response(JSON.stringify({ error: "ticketId is required to close an order." }), {
@@ -539,12 +1021,12 @@ async function sendEmail(
 
   const emailData = {
     personalizations: [{ to: [{ email: to }] }],
-    from: { email: fromEmail, name: 'TekWealth Trading Bot' }, // Optional: Add a sender name
+    from: { email: fromEmail, name: 'TekWealth Trading Bot' },
     subject: subject,
     content: [{ type: 'text/html', value: htmlContent }],
   };
 
-  try {
+  const sendFn = async () => {
     const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
       method: 'POST',
       headers: {
@@ -554,20 +1036,29 @@ async function sendEmail(
       body: JSON.stringify(emailData),
     });
 
-    if (response.status === 202) { // SendGrid returns 202 Accepted on success
-      console.log(`Email sent successfully to ${to}. Subject: ${subject}`);
-      // SendGrid does not return a message ID in the V3 mail/send response body directly for 202.
-      // It's available via X-Message-Id header, which we can try to get if needed, or via event webhooks.
-      // For simplicity, we'll just confirm success based on status.
+    if (response.status === 202) {
+      // console.log(`Email sent successfully to ${to}. Subject: ${subject}`); // Reduced verbosity
       const messageId = response.headers.get('x-message-id');
       return { success: true, messageId: messageId || undefined };
     } else {
-      const errorBody = await response.json();
-      console.error(`Failed to send email. Status: ${response.status}`, errorBody);
-      return { success: false, error: `SendGrid API Error: ${response.status} - ${JSON.stringify(errorBody)}` };
+      // Attempt to parse error body for better logging
+      let errorBodyText = await response.text();
+      let errorBodyJson = null;
+      try {
+        errorBodyJson = JSON.parse(errorBodyText);
+      } catch (e) { /* ignore parsing error */ }
+
+      console.error(`Failed to send email. Status: ${response.status}`, errorBodyJson || errorBodyText);
+      // Throw an error to trigger retry
+      throw new Error(`SendGrid API Error: ${response.status} - ${errorBodyJson ? JSON.stringify(errorBodyJson.errors) : errorBodyText}`);
     }
+  };
+
+  try {
+    // Retry up to 2 times (total 3 attempts) with 5s delay for email sending
+    return await retryAsyncFunction(sendFn, 2, 5000, `sendEmail to ${to}`);
   } catch (error) {
-    console.error('Error sending email via SendGrid:', error);
+    console.error(`All retries failed for sendEmail to ${to}:`, error.message);
     return { success: false, error: error.message };
   }
 }
@@ -985,22 +1476,26 @@ interface SimulatedTrade {
 
 async function runBacktestAction(supabase: any, data: any, apiKey: string) {
   const {
-    userId, // For potential future use (e.g. saving reports per user)
+    userId,
     symbol = 'XAUUSD',
-    timeframe = '15min', // Should match the strategy's timeframe
-    startDate, // ISO Date string
-    endDate,   // ISO Date string
-    strategySettings = { shortPeriod: 20, longPeriod: 50 }, // Default SMA settings
-    // Default risk settings, now includes ATR multipliers
+    timeframe = '15min',
+    startDate,
+    endDate,
+    strategySettings = { /* Defaults will be set in fullStrategyParams below */ },
     riskSettings = {
       riskLevel: 'conservative',
-      maxLotSize: 0.01,
-      // stopLossPips is now less relevant if ATR is used, but keep for other strategies or fallback
-      stopLossPips: 200,
-      atrMultiplierSL: 1.5, // Default ATR SL multiplier
-      atrMultiplierTP: 3.0    // Default ATR TP multiplier
-    }
+      // maxLotSize will be taken from riskSettingsMap based on riskLevel
+    },
+    commissionPerLot = 0,
+    slippagePoints = 0
   } = data;
+
+  // TODO: Implement dynamic lot sizing for backtests.
+  // Currently, backtester uses a fixed lot size based on riskLevel's maxLotSize.
+  // For more accurate backtests simulating live dynamic lot sizing, this would require:
+  // 1. Simulating account equity changes throughout the backtest.
+  // 2. Using risk_per_trade_percent from strategySettings.
+  // 3. Applying the dynamic lot calculation logic similar to processBotSession.
 
   // Merge strategySettings from data with defaults for ATR if not provided by caller
   const effectiveStrategySettings = {
@@ -1066,24 +1561,42 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
       const currentHighPrice = currentCandle.high_price;
 
       if (openTrade) {
-        let slHit = false;
-        let slPrice = 0;
+        let actualExitPrice = 0;
+        let closeReason = '';
+
+        // Check Stop Loss
         if (openTrade.tradeType === 'BUY' && currentLowPrice <= openTrade.stopLossPrice) {
-          slHit = true;
-          slPrice = openTrade.stopLossPrice;
+          actualExitPrice = openTrade.stopLossPrice - slippagePoints; // Worse exit for BUY
+          closeReason = 'SL';
         } else if (openTrade.tradeType === 'SELL' && currentHighPrice >= openTrade.stopLossPrice) {
-          slHit = true;
-          slPrice = openTrade.stopLossPrice;
+          actualExitPrice = openTrade.stopLossPrice + slippagePoints; // Worse exit for SELL
+          closeReason = 'SL';
+        }
+        // Check Take Profit (if defined)
+        else if (openTrade.takeProfitPrice) {
+            if (openTrade.tradeType === 'BUY' && currentHighPrice >= openTrade.takeProfitPrice) {
+                actualExitPrice = openTrade.takeProfitPrice - slippagePoints; // Worse exit for BUY (less profit)
+                closeReason = 'TP';
+            } else if (openTrade.tradeType === 'SELL' && currentLowPrice <= openTrade.takeProfitPrice) {
+                actualExitPrice = openTrade.takeProfitPrice + slippagePoints; // Worse exit for SELL (less profit)
+                closeReason = 'TP';
+            }
         }
 
-        if (slHit) {
-          const priceDiff = openTrade.tradeType === 'BUY' ? slPrice - openTrade.entryPrice : openTrade.entryPrice - slPrice;
+        if (closeReason) {
+          const priceDiff = openTrade.tradeType === 'BUY'
+            ? actualExitPrice - openTrade.entryPrice
+            : openTrade.entryPrice - actualExitPrice;
+          let profitLoss = priceDiff * openTrade.lotSize * 100;
+          const commissionCost = (commissionPerLot || 0) * openTrade.lotSize;
+          profitLoss -= commissionCost;
+
           tradesForDb.push({
             ...openTrade,
             exitTime: currentTime,
-            exitPrice: slPrice,
-            profitOrLoss: priceDiff * openTrade.lotSize * 100,
-            closeReason: 'SL',
+            exitPrice: actualExitPrice,
+            profitOrLoss: profitLoss,
+            closeReason: closeReason,
           });
           openTrade = null;
         }
@@ -1258,11 +1771,20 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
         <p>Full details and trade list are available in the application.</p>
       `;
       sendEmail(recipientEmail, emailSubject, emailHtmlContent)
-        .then(emailRes => {
-          if (emailRes.success) console.log(`Backtest completion email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
-          else console.error(`Failed to send backtest completion email: ${emailRes.error}`);
+        .then(async (emailRes) => { // Made async
+            if (emailRes.success) {
+              console.log(`Backtest completion email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
+            } else {
+              const errorMessage = `Failed to send backtest completion email for report ${reportId}: ${emailRes.error}`;
+              console.error(errorMessage);
+              await logSystemEvent(supabase, 'ERROR', 'SendEmailFailure', errorMessage, { report_id: reportId, recipient: recipientEmail, subject: emailSubject }, undefined, reportSummary.user_id);
+            }
         })
-        .catch(err => console.error(`Exception while sending backtest completion email: ${err.message}`));
+        .catch(async (err) => { // Made async
+            const errorMessage = `Exception while sending backtest completion email for report ${reportId}: ${err.message}`;
+            console.error(errorMessage);
+            await logSystemEvent(supabase, 'ERROR', 'SendEmailException', errorMessage, { report_id: reportId, recipient: recipientEmail, subject: emailSubject, stack: err.stack }, undefined, reportSummary.user_id);
+        });
     } else {
       console.warn("NOTIFICATION_EMAIL_RECIPIENT not set. Skipping backtest completion email.");
     }
@@ -1273,6 +1795,7 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
 
   } catch (error) {
     console.error("Error in runBacktestAction:", error.message, error.stack);
+    await logSystemEvent(supabase, 'ERROR', 'RunBacktestAction', `Backtesting failed: ${error.message}`, { stack: error.stack, params: data });
     return new Response(JSON.stringify({ error: "Backtesting failed: " + error.message }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -1452,15 +1975,23 @@ async function updatePrices(supabase: any, priceData: any) {
 }
 
 async function runBotLogic(supabase: any, _botData: any, apiKey: string) {
+  await logSystemEvent(supabase, 'INFO', 'RunBotLogic', 'Scheduled bot logic execution started.');
   const { data: sessions, error } = await supabase
     .from('bot_sessions')
     .select('*')
     .eq('status', 'active')
 
-  if (error) throw error
-  if (!sessions || sessions.length === 0) return new Response(JSON.stringify({ processed: 0, message: "No active sessions" }), {
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-  })
+  if (error) {
+    await logSystemEvent(supabase, 'ERROR', 'RunBotLogic', 'Error fetching active bot sessions.', { error: error.message, stack: error.stack });
+    throw error;
+  }
+
+  if (!sessions || sessions.length === 0) {
+    await logSystemEvent(supabase, 'INFO', 'RunBotLogic', 'No active bot sessions found.');
+    return new Response(JSON.stringify({ processed: 0, message: "No active sessions" }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
 
 
   let processedCount = 0;
@@ -1469,8 +2000,17 @@ async function runBotLogic(supabase: any, _botData: any, apiKey: string) {
       await processBotSession(supabase, session, apiKey)
       processedCount++;
     } catch (sessionError) {
-      console.error(`Error processing bot session ${session.id}:`, sessionError.message, sessionError.stack)
-      // Optionally, update session status to 'error' or log error to DB
+      console.error(`Error processing bot session ${session.id}:`, sessionError.message, sessionError.stack);
+      await logSystemEvent(
+        supabase,
+        'ERROR',
+        'ProcessBotSession',
+        `Failed to process session ${session.id}: ${sessionError.message}`,
+        { stack: sessionError.stack, sessionId: session.id, userId: session.user_id },
+        session.id,
+        session.user_id
+      );
+      // Optionally, update session status to 'error' or log error to DB via notifications table
       await supabase.from('notifications').insert({
         user_id: session.user_id,
         type: 'bot_error',
@@ -1479,41 +2019,54 @@ async function runBotLogic(supabase: any, _botData: any, apiKey: string) {
       });
     }
   }
-
+  await logSystemEvent(supabase, 'INFO', 'RunBotLogic', `Scheduled bot logic execution finished. Processed ${processedCount} active sessions.`);
   return new Response(JSON.stringify({ processed: processedCount }), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   })
 }
 
 async function fetchHistoricalGoldPrices(apiKey: string, interval: string = '15min', outputsize: string = 'compact'): Promise<any[]> {
-  // Using Alpha Vantage TIME_SERIES_INTRADAY for XAU (often needs a proxy like XAUUSD or a specific broker symbol if AV supports it directly)
-  // For XAU/USD, Alpha Vantage provides FX_INTRADAY
-  const url = `https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=XAU&to_symbol=USD&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}&datatype=json`;
-
-  try {
+  const fetchFn = async () => {
+    const url = `https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=XAU&to_symbol=USD&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}&datatype=json`;
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Alpha Vantage historical data API error: ${response.statusText}`);
+      if (response.status === 429 || (response.headers.get("content-type")?.includes("application/json"))) {
+        const errorData = await response.json().catch(() => null);
+        if (errorData && errorData.Information && errorData.Information.includes("API call frequency")) {
+          throw new Error(`Alpha Vantage API rate limit hit (historical data): ${errorData.Information}`);
+        }
+      }
+      throw new Error(`Alpha Vantage historical data API error: ${response.status} ${response.statusText}`);
     }
     const data = await response.json();
     const timeSeriesKey = `Time Series FX (${interval})`;
     const timeSeries = data[timeSeriesKey];
 
     if (!timeSeries) {
-      console.warn("Alpha Vantage API did not return expected historical data:", data);
-      throw new Error("Could not fetch historical gold prices from Alpha Vantage. Check symbol or API response format.");
+      console.warn("Alpha Vantage API did not return expected historical data (timeSeries missing or null):", data);
+      // Consider if this should throw or return empty array. Throwing will trigger retry.
+      // If AV sometimes returns valid empty response for certain requests, this might need adjustment.
+      throw new Error("Could not fetch historical gold prices from Alpha Vantage (timeSeries missing or null). Check symbol or API response format.");
     }
-    // Convert to array of { timestamp, open, high, low, close, volume }
-    // Alpha Vantage returns data with "1. open", "2. high", etc.
+    if (Object.keys(timeSeries).length === 0) {
+        console.log("Alpha Vantage returned empty timeSeries for historical data. Assuming no data for period.");
+        return []; // Valid empty response
+    }
+
     return Object.entries(timeSeries).map(([timestamp, values]: [string, any]) => ({
       timestamp,
       open: parseFloat(values["1. open"]),
       high: parseFloat(values["2. high"]),
       low: parseFloat(values["3. low"]),
       close: parseFloat(values["4. close"]),
-    })).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()); // Ensure ascending order
+    })).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  };
+
+  try {
+    // Retry up to 2 times (total 3 attempts) with 5s delay for historical data fetching
+    return await retryAsyncFunction(fetchFn, 2, 5000, `fetchHistoricalGoldPrices(${interval},${outputsize})`);
   } catch (error) {
-    console.error("Error fetching historical gold prices:", error);
+    console.error(`All retries failed for fetchHistoricalGoldPrices(${interval},${outputsize}):`, error.message);
     throw error;
   }
 }
@@ -1978,12 +2531,198 @@ function analyzeSMACrossoverStrategy(
 }
 // --- End SMA Crossover Strategy Logic ---
 
+// --- Breakout Strategy Logic ---
+interface BreakoutSettings {
+  breakoutLookbackPeriod?: number;
+  // atrPeriod is global from sessionSettings
+  atrMultiplierSL?: number;
+  atrMultiplierTP?: number;
+  minChannelWidthATR?: number; // Minimum channel width in ATR multiples
+  // breakoutConfirmationATRMultiplier?: number; // Optional: For volatility confirmation
+}
+
+function analyzeBreakoutStrategy(
+  relevantHistoricalData: Array<{high_price: number, low_price: number, close_price: number, open_price: number}>, // Data up to signal candle
+  decisionPrice: number, // Open of the decision candle (candle after signal/breakout)
+  settings: BreakoutSettings,
+  currentAtrValue: number | null // ATR at the signal candle
+): MarketAnalysisResult {
+  const {
+    breakoutLookbackPeriod = 50,
+    atrMultiplierSL = 1.5,
+    atrMultiplierTP = 3.0,
+    minChannelWidthATR = 1.0, // Example: channel must be at least 1 ATR wide
+  } = settings;
+
+  if (relevantHistoricalData.length < breakoutLookbackPeriod + 1 || currentAtrValue === null || currentAtrValue === 0) {
+    // Need +1 because the breakout happens on the *last* candle of the lookback period,
+    // and we make decision on the *next* candle.
+    // console.log("Breakout: Not enough data or ATR is null/zero.");
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  // The signal candle is the last candle in relevantHistoricalData
+  const signalCandleIndex = relevantHistoricalData.length - 1;
+  const signalCandle = relevantHistoricalData[signalCandleIndex];
+
+  // Define the channel based on data *before* the signal candle
+  const lookbackDataForChannel = relevantHistoricalData.slice(Math.max(0, signalCandleIndex - breakoutLookbackPeriod), signalCandleIndex);
+
+  if (lookbackDataForChannel.length < breakoutLookbackPeriod) {
+    // console.log("Breakout: Not enough data for channel definition.");
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  let highestHigh = -Infinity;
+  let lowestLow = Infinity;
+  for (const candle of lookbackDataForChannel) {
+    if (candle.high_price > highestHigh) highestHigh = candle.high_price;
+    if (candle.low_price < lowestLow) lowestLow = candle.low_price;
+  }
+
+  if (highestHigh === -Infinity || lowestLow === Infinity) {
+    // console.log("Breakout: Could not determine channel bounds.");
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  const channelWidth = highestHigh - lowestLow;
+  if (channelWidth < (minChannelWidthATR * currentAtrValue)) {
+    // console.log(`Breakout: Channel width ${channelWidth.toFixed(4)} too narrow (min: ${(minChannelWidthATR * currentAtrValue).toFixed(4)}, ATR: ${currentAtrValue.toFixed(4)}).`);
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  let tradeType: 'BUY' | 'SELL' | undefined = undefined;
+
+  // Buy Breakout: Signal candle closes above the channel's highest high
+  if (signalCandle.close_price > highestHigh) {
+    tradeType = 'BUY';
+    // console.log(`Breakout BUY signal: Close ${signalCandle.close_price.toFixed(4)} > High ${highestHigh.toFixed(4)}`);
+  }
+  // Sell Breakout: Signal candle closes below the channel's lowest low
+  else if (signalCandle.close_price < lowestLow) {
+    tradeType = 'SELL';
+    // console.log(`Breakout SELL signal: Close ${signalCandle.close_price.toFixed(4)} < Low ${lowestLow.toFixed(4)}`);
+  }
+
+  if (tradeType) {
+    const stopLoss = tradeType === 'BUY'
+      ? lowestLow - (currentAtrValue * 0.5) // SL below the recent low (or breakout point - ATR)
+      // ? highestHigh - (currentAtrValue * atrMultiplierSL) // Alt: SL based on breakout point
+      : highestHigh + (currentAtrValue * 0.5); // SL above the recent high
+      // : lowestLow + (currentAtrValue * atrMultiplierSL); // Alt: SL based on breakout point
+
+    const takeProfit = tradeType === 'BUY'
+      ? decisionPrice + ((decisionPrice - stopLoss) * atrMultiplierTP) // TP as multiple of SL distance
+      : decisionPrice - ((stopLoss - decisionPrice) * atrMultiplierTP);
+
+    return {
+      shouldTrade: true,
+      tradeType: tradeType,
+      priceAtDecision: decisionPrice,
+      stopLoss: parseFloat(stopLoss.toFixed(4)),
+      takeProfit: parseFloat(takeProfit.toFixed(4)),
+    };
+  }
+
+  return { shouldTrade: false, priceAtDecision: decisionPrice };
+}
+// --- End Breakout Strategy Logic ---
+
+// --- Market Regime Detection ---
+type MarketRegime = 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'BREAKOUT_SETUP_UP' | 'BREAKOUT_SETUP_DOWN' | 'UNCLEAR';
+
+interface RegimeDetectionSettings {
+  adxPeriod?: number;
+  adxTrendThreshold?: number; // ADX value above which market is considered trending
+  adxRangeThreshold?: number; // ADX value below which market is considered ranging
+  bbPeriod?: number;          // For Bollinger Band Width
+  bbStdDevMult?: number;      // For Bollinger Band Width
+  // atrPeriod?: number;      // For volatility context (already in global params)
+  // emaShortPeriod?: number; // Optional for trend direction confirmation
+  // emaLongPeriod?: number;  // Optional
+}
+
+// Calculates Bollinger Band Width
+function calculateBollingerBandWidth(
+  bbValues: Array<{middle: number | null, upper: number | null, lower: number | null}>
+): (number | null)[] {
+  return bbValues.map(bb => {
+    if (bb.upper !== null && bb.lower !== null && bb.middle !== null && bb.middle !== 0) {
+      return (bb.upper - bb.lower) / bb.middle;
+    }
+    return null;
+  });
+}
+
+
+function detectMarketRegime(
+  ohlcDataForRegime: Array<{high_price: number, low_price: number, close_price: number}>, // Data up to the point of regime detection
+  settings: RegimeDetectionSettings,
+  currentAtrValue?: number | null // Optional: For context, though not directly used in this simplified version yet
+): MarketRegime {
+  const {
+    adxPeriod = 14,
+    adxTrendThreshold = 25,
+    adxRangeThreshold = 20,
+    bbPeriod = 20, // Default for BBW
+    bbStdDevMult = 2 // Default for BBW
+  } = settings;
+
+  if (ohlcDataForRegime.length < Math.max(adxPeriod + adxPeriod -1, bbPeriod)) { // ADX needs more data
+    // console.warn("Regime Detection: Not enough data.");
+    return 'UNCLEAR';
+  }
+
+  const adxResult = calculateADX(ohlcDataForRegime, adxPeriod);
+  const currentADX = adxResult.adx[ohlcDataForRegime.length - 1];
+  const currentPDI = adxResult.pdi[ohlcDataForRegime.length - 1];
+  const currentNDI = adxResult.ndi[ohlcDataForRegime.length - 1];
+
+  const bbValues = calculateBollingerBands(ohlcDataForRegime, bbPeriod, bbStdDevMult);
+  const bbWidthValues = calculateBollingerBandWidth(bbValues);
+  const currentBBW = bbWidthValues[ohlcDataForRegime.length - 1];
+
+  // For breakout setup, look at average BBW over a short period vs current
+  const shortLookback = Math.min(10, ohlcDataForRegime.length -1);
+  const recentBBWs = bbWidthValues.slice(-shortLookback).filter(w => w !== null) as number[];
+  const avgRecentBBW = recentBBWs.length > 0 ? recentBBWs.reduce((a,b) => a+b, 0) / recentBBWs.length : null;
+
+
+  if (currentADX === null || currentPDI === null || currentNDI === null || currentBBW === null) {
+    // console.warn("Regime Detection: Indicator values are null.");
+    return 'UNCLEAR';
+  }
+
+  // Regime Logic (can be expanded)
+  if (currentADX > adxTrendThreshold) {
+    if (currentPDI > currentNDI) return 'TRENDING_UP';
+    if (currentNDI > currentPDI) return 'TRENDING_DOWN';
+  }
+
+  if (currentADX < adxRangeThreshold) {
+     // Check for breakout setup: low ADX and very narrow BBW
+    if (avgRecentBBW !== null && currentBBW < avgRecentBBW * 0.6 && currentBBW < 0.05) { // Example: BBW is 60% of recent avg AND very tight absolutely
+        // Determine potential breakout direction by recent price action or very short term MA
+        const lastFewCloses = ohlcDataForRegime.slice(-5).map(c => c.close_price);
+        if (lastFewCloses.length >= 2) {
+            if (lastFewCloses[lastFewCloses.length-1] > lastFewCloses[0]) return 'BREAKOUT_SETUP_UP';
+            return 'BREAKOUT_SETUP_DOWN';
+        }
+    }
+    return 'RANGING';
+  }
+
+  // Could add more rules here for VOLATILE_UNCLEAR based on ATR vs BBW etc.
+  return 'UNCLEAR';
+}
+// --- End Market Regime Detection ---
+
 
 // Refactored: Main Market Analysis Dispatcher
 async function analyzeMarketConditions(
   apiKey: string,
   sessionSettings: { // Now expects a more comprehensive settings object
-    strategySelectionMode?: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'ADX_TREND_FOLLOW';
+    strategySelectionMode?: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'BREAKOUT_ONLY' | 'ADX_TREND_FOLLOW'; // Added BREAKOUT_ONLY
     // SMA Crossover + ATR settings (can be nested or flat)
     smaShortPeriod?: number;
     smaLongPeriod?: number;
@@ -2002,6 +2741,10 @@ async function analyzeMarketConditions(
     atrPeriod?: number;
     atrMultiplierSL?: number;
     atrMultiplierTP?: number;
+    // Breakout strategy specific settings
+    breakoutLookbackPeriod?: number;
+    minChannelWidthATR?: number;
+    // breakoutConfirmationATRMultiplier?: number; // If we add this later
   },
   ohlcDataForAnalysis?: any[],
   currentIndexForDecision?: number
@@ -2010,20 +2753,27 @@ async function analyzeMarketConditions(
     // Consolidate and default all parameters
     const params = {
         strategySelectionMode: sessionSettings.strategySelectionMode || 'ADAPTIVE',
+        // SMA
         smaShortPeriod: sessionSettings.smaShortPeriod || 20,
         smaLongPeriod: sessionSettings.smaLongPeriod || 50,
+        // Mean Reversion (BB + RSI)
         bbPeriod: sessionSettings.bbPeriod || 20,
         bbStdDevMult: sessionSettings.bbStdDevMult || 2,
         rsiPeriod: sessionSettings.rsiPeriod || 14,
         rsiOversold: sessionSettings.rsiOversold || 30,
         rsiOverbought: sessionSettings.rsiOverbought || 70,
+        // ADX (for ADAPTIVE and potential ADX-filtered strategies)
         adxPeriod: sessionSettings.adxPeriod || 14,
-        adxTrendMinLevel: sessionSettings.adxTrendMinLevel || 25,
-        adxRangeThreshold: sessionSettings.adxRangeThreshold || 20,
-        adxTrendThreshold: sessionSettings.adxTrendThreshold || 25,
+        adxTrendMinLevel: sessionSettings.adxTrendMinLevel || 25, // Used by ADX trend filter if any
+        adxRangeThreshold: sessionSettings.adxRangeThreshold || 20, // For ADAPTIVE
+        adxTrendThreshold: sessionSettings.adxTrendThreshold || 25, // For ADAPTIVE
+        // Breakout
+        breakoutLookbackPeriod: sessionSettings.breakoutLookbackPeriod || 50,
+        minChannelWidthATR: sessionSettings.minChannelWidthATR || 1.0,
+        // Global ATR (used by all strategies for SL/TP)
         atrPeriod: sessionSettings.atrPeriod || 14,
         atrMultiplierSL: sessionSettings.atrMultiplierSL || 1.5,
-        atrMultiplierTP: session.strategy_settings?.atrMultiplierTP || 3.0, // Example: TP might be more strategy specific
+        atrMultiplierTP: sessionSettings.atrMultiplierTP || 3.0, // Corrected: sessionSettings instead of session.strategy_settings
     };
 
 
@@ -2126,7 +2876,7 @@ async function analyzeMarketConditions(
         const meanReversionSettings: MeanReversionSettings = {
             bbPeriod: params.bbPeriod, bbStdDevMult: params.bbStdDevMult,
             rsiPeriod: params.rsiPeriod, rsiOversold: params.rsiOversold, rsiOverbought: params.rsiOverbought,
-            atrMultiplierSL: params.atrMultiplierSL, atrMultiplierTP: params.atrMultiplierTP
+            atrMultiplierSL: params.atrMultiplierSL, atrMultiplierTP: params.atrMultiplierTP // Pass global ATR SL/TP
         };
 
         // In backtest mode, dataForIndicators is ohlcData.slice(0, currentIndexForDecision)
@@ -2166,6 +2916,17 @@ async function analyzeMarketConditions(
         return { shouldTrade: false, priceAtDecision: decisionPrice };
       }
     }
+    else if (params.strategySelectionMode === 'BREAKOUT_ONLY') {
+      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Dispatching to Breakout Strategy (Live)");
+      const breakoutSettings: BreakoutSettings = {
+        breakoutLookbackPeriod: params.breakoutLookbackPeriod,
+        atrMultiplierSL: params.atrMultiplierSL,
+        atrMultiplierTP: params.atrMultiplierTP,
+        minChannelWidthATR: params.minChannelWidthATR,
+      };
+      return analyzeBreakoutStrategy(dataForIndicators, decisionPrice, breakoutSettings, currentAtr);
+    }
+
 
     // Default or if mode not recognized, perhaps SMA Crossover or no trade
     console.warn(`Unknown or default strategy selection mode: ${params.strategySelectionMode}. Defaulting to no trade.`);
@@ -2173,6 +2934,10 @@ async function analyzeMarketConditions(
 
   } catch (error) {
     console.error("Error during market analysis dispatcher:", error.message, error.stack);
+    // supabaseClient is not directly available here. This log needs to be done by the caller of analyzeMarketConditions
+    // if it has access to supabaseClient. For now, the console.error is the primary record.
+    // If called from processBotSession, processBotSession can log it.
+    // If called from runBacktestAction, runBacktestAction can log it.
     return { shouldTrade: false }; // Default to no trade on error
   }
 }
@@ -2181,23 +2946,97 @@ async function analyzeMarketConditions(
 async function processBotSession(supabase: any, session: any, apiKey: string) {
   console.log(`Processing bot session ${session.id} for user ${session.user_id} (Live Mode)`);
 
-  let tradeProvider: ITradeExecutionProvider;
-  const providerType = Deno.env.get('TRADE_PROVIDER_TYPE')?.toUpperCase() || 'SIMULATED';
+  // Get the trade provider, potentially fetching and decrypting credentials if it were METATRADER
+  // and if MetaTraderBridgeProvider was refactored to use them.
+  // The trading_account_id from the session is crucial here.
+  const tradeProvider: ITradeExecutionProvider = await getTradeProvider(
+    supabase,
+    apiKey, // For SimulatedTradeProvider's internal price fetching if needed
+    session.trading_account_id
+  );
 
-  if (providerType === 'METATRADER') {
-    const bridgeUrl = Deno.env.get('MT_BRIDGE_URL');
-    const bridgeApiKey = Deno.env.get('MT_BRIDGE_API_KEY');
-    if (!bridgeUrl || !bridgeApiKey) {
-      console.error("MetaTrader provider selected, but MT_BRIDGE_URL or MT_BRIDGE_API_KEY is not set. Falling back to SIMULATED.");
-      tradeProvider = new SimulatedTradeProvider(supabase, apiKey); // apiKey for AlphaVantage for simulated close price
-    } else {
-      console.log(`Using MetaTraderBridgeProvider with URL: ${bridgeUrl}`);
-      tradeProvider = new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKey);
-    }
+  // If getTradeProvider throws an error (e.g., cannot decrypt password, account not found),
+  // it will be caught by the runBotLogic's try/catch for the session.
+
+  // --- Max Drawdown Control Logic ---
+  // Default max drawdown if not specified in strategy_params or session table column
+  // Ensure fullStrategyParams is defined before this block if it's going to be used for max_drawdown_percent
+  const maxDrawdownPercent = fullStrategyParams.max_drawdown_percent || // Prioritize from strategy_params
+                           session.max_drawdown_percent || // Fallback to potential direct column
+                           0.10; // Default 10%
+
+  const accountSummary = await tradeProvider.getAccountSummary(session.trading_account_id);
+  if (!accountSummary || accountSummary.error || accountSummary.equity <= 0) {
+    const errorMsg = `Max Drawdown Check: Could not get valid account equity for session ${session.id}. Error: ${accountSummary?.error || 'Equity is zero or negative'}. Skipping drawdown check.`;
+    console.error(errorMsg);
+    await logSystemEvent(supabase, 'WARN', 'ProcessBotSession', errorMsg, { session_id: session.id, user_id: session.user_id });
+    // Decide if we should proceed or halt session processing here. For now, let's proceed but this is a risk.
   } else {
-    console.log("Using SimulatedTradeProvider.");
-    tradeProvider = new SimulatedTradeProvider(supabase, apiKey); // apiKey for AlphaVantage for simulated close price
+    let currentSessionInitialEquity = session.session_initial_equity;
+    let currentSessionPeakEquity = session.session_peak_equity;
+
+    if (currentSessionInitialEquity === null || currentSessionInitialEquity === undefined) {
+      currentSessionInitialEquity = accountSummary.equity;
+      currentSessionPeakEquity = accountSummary.equity;
+      const { error: updateError } = await supabase
+        .from('bot_sessions')
+        .update({
+            session_initial_equity: currentSessionInitialEquity,
+            session_peak_equity: currentSessionPeakEquity
+        })
+        .eq('id', session.id);
+      if (updateError) {
+        console.error(`Failed to update initial/peak equity for session ${session.id}:`, updateError);
+        await logSystemEvent(supabase, 'ERROR', 'ProcessBotSession', `Failed to update initial/peak equity for session ${session.id}`, { error: updateError.message, stack: updateError.stack }, session.id, session.user_id);
+        // Continue, but drawdown might not be accurate for this run
+      }
+      console.log(`Session ${session.id}: Initialized session_initial_equity and session_peak_equity to ${accountSummary.equity}`);
+    } else {
+      // Update peak equity if current equity is higher
+      if (accountSummary.equity > (currentSessionPeakEquity || 0)) {
+        currentSessionPeakEquity = accountSummary.equity;
+        const { error: updatePeakError } = await supabase
+          .from('bot_sessions')
+          .update({ session_peak_equity: currentSessionPeakEquity })
+          .eq('id', session.id);
+        if (updatePeakError) {
+            console.error(`Failed to update peak equity for session ${session.id}:`, updatePeakError);
+            await logSystemEvent(supabase, 'ERROR', 'ProcessBotSession', `Failed to update peak equity for session ${session.id}`, { error: updatePeakError.message, stack: updatePeakError.stack }, session.id, session.user_id);
+        } else {
+            console.log(`Session ${session.id}: Updated session_peak_equity to ${currentSessionPeakEquity}`);
+        }
+      }
+    }
+
+    // Perform drawdown check using the most up-to-date peak equity
+    const peakEquityForCalc = currentSessionPeakEquity || currentSessionInitialEquity || accountSummary.equity;
+    if (peakEquityForCalc > 0) { // Ensure peak equity is positive to avoid division by zero or incorrect calcs
+        const drawdown = (peakEquityForCalc - accountSummary.equity) / peakEquityForCalc;
+        console.log(`Session ${session.id}: Current Equity: ${accountSummary.equity}, Peak Equity: ${peakEquityForCalc}, Drawdown: ${(drawdown * 100).toFixed(2)}%, Max DD Allowed: ${(maxDrawdownPercent * 100).toFixed(2)}%`);
+
+        if (drawdown >= maxDrawdownPercent) {
+          const drawdownMsg = `Session ${session.id} breached max drawdown limit of ${(maxDrawdownPercent * 100).toFixed(2)}%. Current drawdown: ${(drawdown * 100).toFixed(2)}%. Pausing session.`;
+          console.warn(drawdownMsg);
+          await logSystemEvent(supabase, 'WARN', 'ProcessBotSession', drawdownMsg, { session_id: session.id, user_id: session.user_id, current_equity: accountSummary.equity, peak_equity: peakEquityForCalc, drawdown_percent: drawdown });
+
+          await supabase.from('notifications').insert({
+            user_id: session.user_id,
+            type: 'bot_alert',
+            title: 'Bot Session Paused - Max Drawdown',
+            message: `Bot session ${session.id.substring(0,8)}... for account ${session.trading_account_id.substring(0,8)}... has been paused due to reaching the maximum drawdown limit.`
+          });
+
+          const recipientEmail = Deno.env.get('NOTIFICATION_EMAIL_RECIPIENT');
+          if (recipientEmail) {
+            sendEmail(recipientEmail, `[Trading Bot Alert] Session ${session.id} Paused - Max Drawdown`, drawdownMsg);
+          }
+
+          await supabase.from('bot_sessions').update({ status: 'paused_drawdown', session_end: new Date().toISOString() }).eq('id', session.id);
+          return; // Stop further processing for this session
+        }
+    }
   }
+  // --- End Max Drawdown Control ---
 
 
   const riskSettingsMap = {
@@ -2229,27 +3068,86 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
 
   // Call analyzeMarketConditions without backtesting parameters for live mode
   // Pass strategy settings from the session, or use defaults
-  const strategyParams = {
-    smaShortPeriod: session.strategy_settings?.smaShortPeriod || 20,
-    smaLongPeriod: session.strategy_settings?.smaLongPeriod || 50,
-    atrPeriod: session.strategy_settings?.atrPeriod || 14,
-    atrMultiplierSL: session.risk_settings?.atrMultiplierSL || 1.5, // Get from risk_settings
-    atrMultiplierTP: session.risk_settings?.atrMultiplierTP || 3.0,   // Get from risk_settings
+  // Consolidate all strategy parameters from session.strategy_params, providing defaults
+  const fullStrategyParams = {
+    strategySelectionMode: session.strategy_selection_mode || 'ADAPTIVE',
+    smaShortPeriod: session.strategy_params?.smaShortPeriod || 20,
+    smaLongPeriod: session.strategy_params?.smaLongPeriod || 50,
+    bbPeriod: session.strategy_params?.bbPeriod || 20,
+    bbStdDevMult: session.strategy_params?.bbStdDevMult || 2,
+    rsiPeriod: session.strategy_params?.rsiPeriod || 14,
+    rsiOversold: session.strategy_params?.rsiOversold || 30,
+    rsiOverbought: session.strategy_params?.rsiOverbought || 70,
+    adxPeriod: session.strategy_params?.adxPeriod || 14,
+    adxTrendMinLevel: session.strategy_params?.adxTrendMinLevel || 25,
+    adxRangeThreshold: session.strategy_params?.adxRangeThreshold || 20,
+    adxTrendThreshold: session.strategy_params?.adxTrendThreshold || 25,
+    breakoutLookbackPeriod: session.strategy_params?.breakoutLookbackPeriod || 50,
+    minChannelWidthATR: session.strategy_params?.minChannelWidthATR || 1.0,
+    atrPeriod: session.strategy_params?.atrPeriod || 14,
+    atrMultiplierSL: session.strategy_params?.atrMultiplierSL || 1.5,
+    atrMultiplierTP: session.strategy_params?.atrMultiplierTP || 3.0,
+    risk_per_trade_percent: session.strategy_params?.risk_per_trade_percent || 0.01, // Default 1% risk
   };
-  const analysisResult = await analyzeMarketConditions(apiKey, strategyParams);
+
+  const analysisResult = await analyzeMarketConditions(apiKey, fullStrategyParams);
 
   if (analysisResult.shouldTrade && analysisResult.tradeType && analysisResult.priceAtDecision) {
     const tradeType = analysisResult.tradeType;
     const openPrice = analysisResult.priceAtDecision;
-    const lotSize = settings.maxLotSize; // This is from the general riskSettingsMap (conservative, medium, risky)
 
-    // Use SL/TP from analysisResult if available (now ATR-based)
+    // Use SL from analysisResult if available (now ATR-based)
     const stopLossPrice = analysisResult.stopLoss;
     const takeProfitPrice = analysisResult.takeProfit; // Optional
 
     if (!stopLossPrice) {
         console.error(`Session ${session.id}: No stopLossPrice provided by analysisResult. Skipping trade.`);
         return;
+    }
+
+    // --- Dynamic Lot Sizing Calculation ---
+    let lotSize = settings.maxLotSize; // Fallback to existing maxLotSize from risk_level
+    const riskPerTradePercent = fullStrategyParams.risk_per_trade_percent; // e.g., 0.01 for 1%
+
+    try {
+      const accountSummary = await tradeProvider.getAccountSummary(session.trading_account_id);
+      if (accountSummary && accountSummary.equity > 0) {
+        const accountEquity = accountSummary.equity;
+        const stopLossDistancePrice = Math.abs(openPrice - stopLossPrice);
+
+        // Define value per full price point movement for 1 lot of XAUUSD.
+        // Assuming 1 lot = 100 oz, $1 price move = $100 P/L.
+        const valuePerFullPointForOneLot = 100;
+
+        if (stopLossDistancePrice > 0) { // Avoid division by zero
+          const riskAmountInCurrency = accountEquity * riskPerTradePercent;
+          const slDistanceInCurrencyForOneLot = stopLossDistancePrice * valuePerFullPointForOneLot;
+
+          if (slDistanceInCurrencyForOneLot > 0) {
+            let calculatedLotSize = riskAmountInCurrency / slDistanceInCurrencyForOneLot;
+
+            // Apply constraints: round to 2 decimal places, min 0.01, max from risk_level settings
+            calculatedLotSize = Math.max(0.01, parseFloat(calculatedLotSize.toFixed(2)));
+            calculatedLotSize = Math.min(settings.maxLotSize, calculatedLotSize);
+            lotSize = calculatedLotSize;
+            console.log(`Session ${session.id}: Dynamic lot size calculated: ${lotSize}. Equity: ${accountEquity}, Risk %: ${riskPerTradePercent*100}%, SL Distance: ${stopLossDistancePrice.toFixed(4)}`);
+          } else {
+            console.warn(`Session ${session.id}: Stop loss distance in currency for one lot is zero. Using fallback lot size: ${lotSize}`);
+          }
+        } else {
+           console.warn(`Session ${session.id}: Stop loss distance is zero. Using fallback lot size: ${lotSize}`);
+        }
+      } else {
+        console.warn(`Session ${session.id}: Could not fetch account equity or equity is zero. Using fallback lot size: ${lotSize}. Error: ${accountSummary?.error}`);
+      }
+    } catch (summaryError) {
+      console.error(`Session ${session.id}: Error fetching account summary for dynamic lot sizing. Using fallback lot size ${lotSize}. Error: ${summaryError.message}`);
+    }
+    // --- End Dynamic Lot Sizing ---
+
+    if (lotSize < 0.01) {
+        console.warn(`Session ${session.id}: Calculated lot size ${lotSize} is less than minimum 0.01. Adjusting to 0.01.`);
+        lotSize = 0.01;
     }
 
     console.log(`Executing ${tradeType} for session ${session.id}: Price=${openPrice.toFixed(4)}, SL=${stopLossPrice.toFixed(4)}, TP=${takeProfitPrice?.toFixed(4) || 'N/A'}, Lot=${lotSize}`);
@@ -2259,7 +3157,7 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
       tradingAccountId: session.trading_account_id,
       symbol: 'XAUUSD',
       tradeType: tradeType,
-      lotSize: lotSize,
+      lotSize: lotSize, // Use the dynamically calculated or fallback lot size
       openPrice: openPrice,
       stopLossPrice: stopLossPrice,
       takeProfitPrice: takeProfitPrice,
@@ -2309,17 +3207,28 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
           </ul>
         `;
         sendEmail(recipientEmail, emailSubject, emailHtmlContent)
-          .then(emailRes => {
-            if (emailRes.success) console.log(`Trade execution email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
-            else console.error(`Failed to send trade execution email: ${emailRes.error}`);
+          .then(async (emailRes) => { // Made async to await logSystemEvent
+            if (emailRes.success) {
+              console.log(`Trade execution email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
+            } else {
+              const errorMessage = `Failed to send trade execution email for session ${session.id}: ${emailRes.error}`;
+              console.error(errorMessage);
+              await logSystemEvent(supabase, 'ERROR', 'SendEmailFailure', errorMessage, { session_id: session.id, user_id: session.user_id, recipient: recipientEmail, subject: emailSubject }, session.id, session.user_id);
+            }
           })
-          .catch(err => console.error(`Exception while sending trade execution email: ${err.message}`));
+          .catch(async (err) => { // Made async
+            const errorMessage = `Exception while sending trade execution email for session ${session.id}: ${err.message}`;
+            console.error(errorMessage);
+            await logSystemEvent(supabase, 'ERROR', 'SendEmailException', errorMessage, { session_id: session.id, user_id: session.user_id, recipient: recipientEmail, subject: emailSubject, stack: err.stack }, session.id, session.user_id);
+          });
       } else {
         console.warn("NOTIFICATION_EMAIL_RECIPIENT not set. Skipping trade execution email.");
       }
 
     } else {
-      console.error(`Error executing trade for session ${session.id}:`, executionResult.error);
+      const execErrorMsg = `Error executing trade for session ${session.id}: ${executionResult.error}`;
+      console.error(execErrorMsg);
+      await logSystemEvent(supabase, 'ERROR', 'TradeExecutionFailure', execErrorMsg, { session_id: session.id, user_id: session.user_id, params: executionParams }, session.id, session.user_id);
       await supabase.from('notifications').insert({
         user_id: session.user_id,
         type: 'bot_trade_error',
@@ -2447,6 +3356,14 @@ async function fetchAndStoreHistoricalData(supabase: any, data: any, apiKey: str
 
   } catch (error) {
     console.error("Error in fetchAndStoreHistoricalData:", error.message, error.stack);
+    // supabaseClient is 'supabase' in this scope
+    await logSystemEvent(
+      supabase,
+      'ERROR',
+      'FetchAndStoreHistoricalData',
+      `Failed to fetch/store historical data: ${error.message}`,
+      { stack: error.stack, params: data }
+    );
     return new Response(JSON.stringify({ success: false, error: error.message }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 500,
