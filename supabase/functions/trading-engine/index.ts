@@ -1912,110 +1912,267 @@ class MetaTraderBridgeProvider implements ITradeExecutionProvider {
 // --- End MetaTrader Bridge Provider ---
 
 
-// Refactored for backtesting and live trading
+// --- SMA Crossover Strategy Logic ---
+interface SMACrossoverSettings {
+  smaShortPeriod?: number;
+  smaLongPeriod?: number;
+  atrPeriod?: number;
+  atrMultiplierSL?: number;
+  atrMultiplierTP?: number;
+}
+
+function analyzeSMACrossoverStrategy(
+  relevantHistoricalData: any[], // Data up to (but not including) the decision candle
+  decisionPrice: number,         // Typically open of the decision candle
+  settings: SMACrossoverSettings,
+  currentAtrValue: number | null
+): MarketAnalysisResult {
+  const {
+    smaShortPeriod = 20,
+    smaLongPeriod = 50,
+    atrMultiplierSL = 1.5,
+    atrMultiplierTP = 3,
+  } = settings;
+
+  if (relevantHistoricalData.length < smaLongPeriod || currentAtrValue === null) {
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  const closePrices = relevantHistoricalData.map(p => p.close_price || p.close);
+
+  const smaShort = calculateSMA(closePrices, smaShortPeriod)[relevantHistoricalData.length -1];
+  const smaLong = calculateSMA(closePrices, smaLongPeriod)[relevantHistoricalData.length -1];
+
+  const prevClosePrices = closePrices.slice(0, -1);
+  const smaShortPrev = calculateSMA(prevClosePrices, smaShortPeriod)[prevClosePrices.length -1];
+  const smaLongPrev = calculateSMA(prevClosePrices, smaLongPeriod)[prevClosePrices.length -1];
+
+  if (smaShort === null || smaLong === null || smaShortPrev === null || smaLongPrev === null) {
+    return { shouldTrade: false, priceAtDecision: decisionPrice };
+  }
+
+  let tradeType: 'BUY' | 'SELL' | undefined = undefined;
+  if (smaShortPrev <= smaLongPrev && smaShort > smaLong) {
+    tradeType = 'BUY';
+  } else if (smaShortPrev >= smaLongPrev && smaShort < smaLong) {
+    tradeType = 'SELL';
+  }
+
+  if (tradeType) {
+    const stopLoss = tradeType === 'BUY'
+      ? decisionPrice - (currentAtrValue * atrMultiplierSL)
+      : decisionPrice + (currentAtrValue * atrMultiplierSL);
+    const takeProfit = tradeType === 'BUY'
+      ? decisionPrice + (currentAtrValue * atrMultiplierTP)
+      : decisionPrice - (currentAtrValue * atrMultiplierTP);
+
+    return {
+      shouldTrade: true,
+      tradeType: tradeType,
+      priceAtDecision: decisionPrice,
+      stopLoss: parseFloat(stopLoss.toFixed(4)),
+      takeProfit: parseFloat(takeProfit.toFixed(4)),
+    };
+  }
+  return { shouldTrade: false, priceAtDecision: decisionPrice };
+}
+// --- End SMA Crossover Strategy Logic ---
+
+
+// Refactored: Main Market Analysis Dispatcher
 async function analyzeMarketConditions(
-  apiKey: string, // Still needed for live mode's getCurrentGoldPrice if not fully covered by ohlcData
-  strategyParams: { // Grouping strategy-specific parameters
-    smaShortPeriod?: number,
-    smaLongPeriod?: number,
-    atrPeriod?: number,
-    atrMultiplierSL?: number,
-    atrMultiplierTP?: number,
-    // Add other strategy params here as needed (e.g., for BB, RSI, ADX later)
-  } = { smaShortPeriod: 20, smaLongPeriod: 50, atrPeriod: 14, atrMultiplierSL: 1.5, atrMultiplierTP: 3 },
-  // Optional parameters for backtesting:
+  apiKey: string,
+  sessionSettings: { // Now expects a more comprehensive settings object
+    strategySelectionMode?: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'ADX_TREND_FOLLOW';
+    // SMA Crossover + ATR settings (can be nested or flat)
+    smaShortPeriod?: number;
+    smaLongPeriod?: number;
+    // Mean Reversion (BB+RSI) + ATR settings
+    bbPeriod?: number;
+    bbStdDevMult?: number;
+    rsiPeriod?: number;
+    rsiOversold?: number;
+    rsiOverbought?: number;
+    // ADX settings (for regime and ADX Trend Follow strategy)
+    adxPeriod?: number;
+    adxTrendMinLevel?: number; // For ADX Trend Follow
+    adxRangeThreshold?: number; // For ADAPTIVE regime
+    adxTrendThreshold?: number; // For ADAPTIVE regime
+    // General ATR settings (can be overridden by strategy-specific ones if defined)
+    atrPeriod?: number;
+    atrMultiplierSL?: number;
+    atrMultiplierTP?: number;
+  },
   ohlcDataForAnalysis?: any[],
   currentIndexForDecision?: number
 ): Promise<MarketAnalysisResult> {
   try {
-    const {
-      smaShortPeriod = 20,
-      smaLongPeriod = 50,
-      atrPeriod = 14,
-      atrMultiplierSL = 1.5,
-      atrMultiplierTP = 3
-    } = strategyParams;
+    // Consolidate and default all parameters
+    const params = {
+        strategySelectionMode: sessionSettings.strategySelectionMode || 'ADAPTIVE',
+        smaShortPeriod: sessionSettings.smaShortPeriod || 20,
+        smaLongPeriod: sessionSettings.smaLongPeriod || 50,
+        bbPeriod: sessionSettings.bbPeriod || 20,
+        bbStdDevMult: sessionSettings.bbStdDevMult || 2,
+        rsiPeriod: sessionSettings.rsiPeriod || 14,
+        rsiOversold: sessionSettings.rsiOversold || 30,
+        rsiOverbought: sessionSettings.rsiOverbought || 70,
+        adxPeriod: sessionSettings.adxPeriod || 14,
+        adxTrendMinLevel: sessionSettings.adxTrendMinLevel || 25,
+        adxRangeThreshold: sessionSettings.adxRangeThreshold || 20,
+        adxTrendThreshold: sessionSettings.adxTrendThreshold || 25,
+        atrPeriod: sessionSettings.atrPeriod || 14,
+        atrMultiplierSL: sessionSettings.atrMultiplierSL || 1.5,
+        atrMultiplierTP: session.strategy_settings?.atrMultiplierTP || 3.0, // Example: TP might be more strategy specific
+    };
+
 
     let decisionPrice: number;
-    let relevantHistoricalData: any[];
+    let dataForIndicators: any[]; // This will hold data up to signal candle (currentIndex-1 or latest-1)
+    let currentCandleOpen: number; // Open price of the candle where action is taken
 
     if (ohlcDataForAnalysis && currentIndexForDecision !== undefined && currentIndexForDecision >= 0) {
-      // Backtesting mode: Use provided historical data
-      if (currentIndexForDecision === 0) { // Not enough data for previous candle's MAs
-          return { shouldTrade: false };
+      // --- Backtesting Mode ---
+      if (currentIndexForDecision === 0) return { shouldTrade: false }; // Not enough data
+
+      dataForIndicators = ohlcDataForAnalysis.slice(0, currentIndexForDecision); // Data up to (but not including) current decision candle
+      currentCandleOpen = ohlcDataForAnalysis[currentIndexForDecision].open_price;
+      decisionPrice = currentCandleOpen; // Decision to enter is at the open of currentIndexForDecision candle
+
+      // Ensure enough data for the longest lookback period of any indicator
+      const minRequiredLength = Math.max(params.smaLongPeriod, params.atrPeriod + 1, params.bbPeriod, params.rsiPeriod, params.adxPeriod + params.adxPeriod -1); // ADX needs more data due to smoothing of DX
+      if (dataForIndicators.length < minRequiredLength) {
+        // console.warn(`Backtest: Not enough data for indicators at index ${currentIndexForDecision}. Have ${dataForIndicators.length}, need ~${minRequiredLength}`);
+        return { shouldTrade: false, priceAtDecision: decisionPrice };
       }
-      // Data for MA calculation is up to one candle *before* the current decision candle
-      relevantHistoricalData = ohlcDataForAnalysis.slice(0, currentIndexForDecision);
-      // Decision price is typically the open of the current candle, or close of previous for signal generation
-      decisionPrice = ohlcDataForAnalysis[currentIndexForDecision].open_price;
-                                       // Or .close_price of [currentIndex-1] depending on strategy rules.
-                                       // For this crossover, decision is based on previous close, action on current open.
+
     } else {
-      // Live trading mode: Fetch live historical data and current price
-      relevantHistoricalData = await fetchHistoricalGoldPrices(apiKey, '15min', 'compact');
-      decisionPrice = await getCurrentGoldPrice(apiKey); // This is the most recent tick price
+      // --- Live Trading Mode ---
+      // Fetch a bit more data than just 'compact' (100) if ADX period is long, to ensure smoothing works.
+      // Max of ADX (e.g., 14*2 = 28), BB (e.g. 20), SMA (e.g. 50)
+      const lookbackNeeded = Math.max(params.smaLongPeriod, params.bbPeriod, params.adxPeriod * 2, params.rsiPeriod, params.atrPeriod) + 5; // Add a small buffer
+      const outputsize = lookbackNeeded > 100 ? 'full' : 'compact'; // 'full' can be very large
+
+      dataForIndicators = await fetchHistoricalGoldPrices(apiKey, '15min', outputsize); // Using 15min as default timeframe for live logic
+      decisionPrice = await getCurrentGoldPrice(apiKey); // This is the most recent tick price for decision
+      currentCandleOpen = decisionPrice; // In live mode, decision and action are based on latest price
+
+      const minRequiredLengthLive = Math.max(params.smaLongPeriod, params.atrPeriod + 1, params.bbPeriod, params.rsiPeriod, params.adxPeriod + params.adxPeriod -1 );
+      if (dataForIndicators.length < minRequiredLengthLive) {
+         console.warn(`Live: Not enough historical data from fetch for indicators. Have ${dataForIndicators.length}, need ~${minRequiredLengthLive}`);
+        return { shouldTrade: false, priceAtDecision: decisionPrice };
+      }
     }
 
-    // Ensure enough data for the longest period of SMAs and ATR
-    const requiredDataLength = Math.max(smaLongPeriod, atrPeriod +1); // ATR needs period+1 to have a valid value at index 'period'
-    if (relevantHistoricalData.length < requiredDataLength) {
-      return { shouldTrade: false, priceAtDecision: decisionPrice };
+    // Calculate common indicators needed by dispatcher or strategies
+    const atrValues = calculateATR(dataForIndicators, params.atrPeriod);
+    const currentAtr = atrValues[dataForIndicators.length - 1];
+
+    if (currentAtr === null) {
+        // console.warn("ATR is null, cannot proceed with strategy analysis.");
+        return { shouldTrade: false, priceAtDecision: decisionPrice };
     }
 
-    const closePrices = relevantHistoricalData.map(p => p.close_price || p.close);
+    // --- Strategy Dispatch Logic ---
+    if (params.strategySelectionMode === 'SMA_ONLY') {
+      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Dispatching to SMA Only Strategy (Live)");
+      return analyzeSMACrossoverStrategy(dataForIndicators, decisionPrice, params, currentAtr);
+    }
+    else if (params.strategySelectionMode === 'MEAN_REVERSION_ONLY') {
+      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Dispatching to Mean Reversion Strategy (Live)");
+       const meanReversionSettings: MeanReversionSettings = {
+            bbPeriod: params.bbPeriod,
+            bbStdDevMult: params.bbStdDevMult,
+            rsiPeriod: params.rsiPeriod,
+            rsiOversold: params.rsiOversold,
+            rsiOverbought: params.rsiOverbought,
+            atrMultiplierSL: params.atrMultiplierSL,
+            atrMultiplierTP: params.atrMultiplierTP,
+        };
+      // For mean reversion, currentIndexForDecision is relative to the *full ohlcDataForAnalysis* if in backtest.
+      // But dataSliceForIndicators was already prepared for it.
+      // The 'currentIndexForDecision' passed to analyzeMeanReversionStrategy should be dataForIndicators.length
+      // as it expects to look at dataForIndicators[dataForIndicators.length-1] as the signal candle.
+      // And the actual decision price is currentCandleOpen (from the *next* candle in backtest)
+      // This requires careful indexing for analyzeMeanReversionStrategy if it's to use the same `currentIndexForDecision` logic as SMA.
+      // Let's adjust `analyzeMeanReversionStrategy` to also receive `relevantHistoricalData` and `decisionPrice`
+      // For now, we'll pass the `currentIndexForDecision` that corresponds to the candle *after* the signal candle in the `dataForIndicators` context.
+      // This means the `analyzeMeanReversionStrategy` uses `currentIndexForDecision - 1` from its input `ohlcDataForAnalysis` for signal.
+      // This is consistent if `dataForIndicators` is passed as its `ohlcDataForAnalysis` and `dataForIndicators.length` as `currentIndexForDecision`.
+      // However, `analyzeMeanReversionStrategy` expects the *full* ohlcDataForAnalysis and currentIndexForDecision to slice itself.
+      // Let's keep it simple for now: it will use the last data point of dataForIndicators for its signals, and decisionPrice is the next open.
 
-    const smaShort = calculateSMA(closePrices, smaShortPeriod);
-    const smaLong = calculateSMA(closePrices, smaLongPeriod);
+      // If in backtesting mode, the `analyzeMeanReversionStrategy` expects `ohlcDataForAnalysis` and `currentIndexForDecision`
+      // where `currentIndexForDecision` is the candle on which action is taken.
+      // It internally looks at `signalCandleIndex = currentIndexForDecision - 1`.
+      // So, we pass the original `ohlcDataForAnalysis` and `currentIndexForDecision` if in backtest mode.
+      // If in live mode, `dataForIndicators` is the historical set, and `decisionPrice` is the live price.
+      // `analyzeMeanReversionStrategy` needs to be aware of this.
+      // For simplicity, let's assume analyzeMeanReversionStrategy will use the last point of its input data for signal,
+      // and a separate decisionPrice.
 
-    const smaShortPrev = calculateSMA(closePrices.slice(0, -1), smaShortPeriod);
-    const smaLongPrev = calculateSMA(closePrices.slice(0, -1), smaLongPeriod);
+      // This part needs careful alignment of indexing between backtest and live for Mean Reversion.
+      // Let's assume for now that for live mode, analyzeMeanReversionStrategy uses the latest from `dataForIndicators`
+      // and `decisionPrice` is the current live price.
+      // For backtest mode, it receives `ohlcDataForAnalysis` and `currentIndexForDecision`.
 
-    // Calculate ATR
-    // For ATR, we need the data up to the point of decision (currentIndexForDecision -1 for backtest, or latest for live)
-    // The ATR value at index `k` corresponds to the ATR *after* candle `k` has closed.
-    // So for a decision at candle `i`, we use ATR value from candle `i-1`.
-    const atrValues = calculateATR(relevantHistoricalData, atrPeriod);
-    const currentAtr = atrValues[relevantHistoricalData.length - 1]; // ATR of the last fully formed candle in relevantHistoricalData
+      // The `analyzeMeanReversionStrategy` is already designed to take `ohlcDataForAnalysis` and `currentIndexForDecision`
+      // where `currentIndexForDecision` is the candle whose open is the `decisionPrice`.
+      // So, for live mode, we'd pass `dataForIndicators` and conceptually `dataForIndicators.length` as `currentIndexForDecision`.
+      // And `decisionPrice` would be the external live price.
+      // This is getting complex. Let's simplify: the strategy functions will always get data up to the point *before* decision.
+      // The `decisionPrice` is then the open of the *next* candle (or current live price).
 
-    if (smaShort === null || smaLong === null || smaShortPrev === null || smaLongPrev === null || currentAtr === null) {
-      return { shouldTrade: false, priceAtDecision: decisionPrice };
+        const meanReversionSettings: MeanReversionSettings = {
+            bbPeriod: params.bbPeriod, bbStdDevMult: params.bbStdDevMult,
+            rsiPeriod: params.rsiPeriod, rsiOversold: params.rsiOversold, rsiOverbought: params.rsiOverbought,
+            atrMultiplierSL: params.atrMultiplierSL, atrMultiplierTP: params.atrMultiplierTP
+        };
+
+        // In backtest mode, dataForIndicators is ohlcData.slice(0, currentIndexForDecision)
+        // The actual decision candle is ohlcData[currentIndexForDecision]
+        // analyzeMeanReversionStrategy will use signalCandleIndex = (its_currentIndexForDecision) - 1
+        // So, if we pass `dataForIndicators` as its ohlc, and `dataForIndicators.length` as its currentIndex,
+        // then signalCandleIndex becomes `dataForIndicators.length - 1`.
+        // This is correct: it uses the last candle of `dataForIndicators` as the signal candle.
+        // The `decisionPrice` is then `currentCandleOpen` (backtest) or live `decisionPrice`.
+
+        // Simpler: each strategy function gets `dataForSignalCandleAndEarlier` and `decisionPrice`.
+        return analyzeMeanReversionStrategy(dataForIndicators, dataForIndicators.length, meanReversionSettings, currentAtr);
+
+    }
+    else if (params.strategySelectionMode === 'ADAPTIVE') {
+      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Dispatching via ADAPTIVE Strategy (Live)");
+      const adxSeries = calculateADX(dataForIndicators, params.adxPeriod);
+      const currentADX = adxSeries.adx[dataForIndicators.length - 1];
+
+      if (currentADX === null) return { shouldTrade: false, priceAtDecision: decisionPrice };
+
+      console.log(`ADAPTIVE mode: ADX(${params.adxPeriod}) = ${currentADX.toFixed(2)}`);
+
+      if (currentADX > params.adxTrendThreshold) {
+        console.log("ADAPTIVE: Detected TRENDING market. Using SMA Crossover.");
+        return analyzeSMACrossoverStrategy(dataForIndicators, decisionPrice, params, currentAtr);
+      } else if (currentADX < params.adxRangeThreshold) {
+        console.log("ADAPTIVE: Detected RANGING market. Using Mean Reversion.");
+         const meanReversionSettings: MeanReversionSettings = {
+            bbPeriod: params.bbPeriod, bbStdDevMult: params.bbStdDevMult,
+            rsiPeriod: params.rsiPeriod, rsiOversold: params.rsiOversold, rsiOverbought: params.rsiOverbought,
+            atrMultiplierSL: params.atrMultiplierSL, atrMultiplierTP: params.atrMultiplierTP
+        };
+        return analyzeMeanReversionStrategy(dataForIndicators, dataForIndicators.length, meanReversionSettings, currentAtr);
+      } else {
+        console.log("ADAPTIVE: Market regime UNCLEAR (ADX between thresholds). No trade.");
+        return { shouldTrade: false, priceAtDecision: decisionPrice };
+      }
     }
 
-    if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) { // Live mode logging
-        console.log(`SMA Analysis (Live): Decision Price: ${decisionPrice.toFixed(4)}, SMA(${smaShortPeriod}): ${smaShort.toFixed(4)}, SMA(${smaLongPeriod}): ${smaLong.toFixed(4)}, ATR(${atrPeriod}): ${currentAtr.toFixed(4)}`);
-        console.log(`SMA Analysis (Live): Prev SMA(${smaShortPeriod}): ${smaShortPrev.toFixed(4)}, Prev SMA(${smaLongPeriod}): ${smaLongPrev.toFixed(4)}`);
-    }
-
-    let tradeType: 'BUY' | 'SELL' | undefined = undefined;
-    if (smaShortPrev <= smaLongPrev && smaShort > smaLong) {
-      tradeType = 'BUY';
-      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Bullish Crossover Detected (Live)");
-    } else if (smaShortPrev >= smaLongPrev && smaShort < smaLong) {
-      tradeType = 'SELL';
-      if (!(ohlcDataForAnalysis && currentIndexForDecision !== undefined)) console.log("Bearish Crossover Detected (Live)");
-    }
-
-    if (tradeType) {
-      const stopLoss = tradeType === 'BUY'
-        ? decisionPrice - (currentAtr * atrMultiplierSL)
-        : decisionPrice + (currentAtr * atrMultiplierSL);
-      const takeProfit = tradeType === 'BUY'
-        ? decisionPrice + (currentAtr * atrMultiplierTP)
-        : decisionPrice - (currentAtr * atrMultiplierTP);
-
-      return {
-        shouldTrade: true,
-        tradeType: tradeType,
-        priceAtDecision: decisionPrice,
-        stopLoss: parseFloat(stopLoss.toFixed(4)), // Ensure precision
-        takeProfit: parseFloat(takeProfit.toFixed(4)) // Ensure precision
-      };
-    }
-
+    // Default or if mode not recognized, perhaps SMA Crossover or no trade
+    console.warn(`Unknown or default strategy selection mode: ${params.strategySelectionMode}. Defaulting to no trade.`);
     return { shouldTrade: false, priceAtDecision: decisionPrice };
 
   } catch (error) {
-    console.error("Error during market analysis:", error.message, error.stack);
+    console.error("Error during market analysis dispatcher:", error.message, error.stack);
     return { shouldTrade: false }; // Default to no trade on error
   }
 }
