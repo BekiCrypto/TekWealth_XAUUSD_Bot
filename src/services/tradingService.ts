@@ -281,6 +281,86 @@ export class TradingService {
     return { data, error };
   }
 
+  // Backtesting Service Methods
+  async runBacktest(params: {
+    userId?: string; // Optional for now, but good to include for future user-specific reports
+    symbol?: string;
+    timeframe?: string;
+    startDate: string; // ISO date string
+    endDate: string;   // ISO date string
+    strategySettings?: any;
+    riskSettings?: any;
+  }) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {
+          action: 'run_backtest_action',
+          data: params
+        },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error running backtest:', error);
+      return { data: null, error };
+    }
+  }
+
+  async getBacktestReport(reportId: string) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {
+          action: 'get_backtest_report_action',
+          data: { reportId }
+        },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error fetching backtest report:', error);
+      return { data: null, error };
+    }
+  }
+
+  async listBacktests(userId?: string) { // Optional userId
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {
+          action: 'list_backtests_action',
+          data: { userId } // Pass userId, backend handles if it's null/undefined
+        },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error listing backtests:', error);
+      return { data: null, error };
+    }
+  }
+
+  async fetchHistoricalData(params: {
+    symbol?: string;
+    fromCurrency?: string;
+    toCurrency?: string;
+    interval?: string;
+    outputsize?: string;
+  }) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {
+          action: 'fetch_historical_data_action',
+          data: params
+        }
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error) {
+      console.error('Error fetching historical data:', error);
+      return { data: null, error };
+    }
+  }
+
+
   // Real-time Price Updates (Polling the backend)
   subscribeToPriceUpdates(callback: (price: number) => void) {
     this.priceCallbacks.push(callback);
