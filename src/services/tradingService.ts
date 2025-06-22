@@ -1,16 +1,58 @@
 import { supabase } from '../lib/supabase';
 import { Database } from '../types/database';
 
+// Re-export or define relevant types
 type TradingAccount = Database['public']['Tables']['trading_accounts']['Row'];
 type Trade = Database['public']['Tables']['trades']['Row'];
-type BotSession = Database['public']['Tables']['bot_sessions']['Row'];
+export type BotSession = Database['public']['Tables']['bot_sessions']['Row'] & {
+  strategy_params?: StrategyParams; // Already a JSONB in DB, so can be typed here
+  strategy_selection_mode?: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'BREAKOUT_ONLY';
+  trading_accounts?: { server_name: string, platform: string }; // For joined data
+};
+type Notification = Database['public']['Tables']['notifications']['Row'];
+
+// Interface for the comprehensive strategy parameters expected by the backend
+// This should align with what `analyzeMarketConditions` and `runBacktestAction` expect.
+export interface StrategyParams {
+  // Common params that might be used by dispatcher or individual strategies
+  atrPeriod?: number;
+  atrMultiplierSL?: number;
+  atrMultiplierTP?: number;
+
+  // SMA Crossover specific
+  smaShortPeriod?: number;
+  smaLongPeriod?: number;
+
+  // Mean Reversion (Bollinger Bands + RSI) specific
+  bbPeriod?: number;
+  bbStdDevMult?: number;
+  rsiPeriod?: number;
+  rsiOversold?: number;
+  rsiOverbought?: number;
+
+  // ADX settings (for regime detection and ADX-filtered strategies)
+  adxPeriod?: number;
+  adxTrendMinLevel?: number; // For confirming trend in strategies
+  adxRangeThreshold?: number; // For ADAPTIVE regime: below this is range
+  adxTrendThreshold?: number; // For ADAPTIVE regime: above this is trend
+
+  // Breakout strategy specific (example)
+  breakoutLookbackPeriod?: number;
+  atrSpikeMultiplier?: number; // For breakout confirmation
+}
+
+// For `closeTradeOrderProvider`
+export interface CloseOrderProviderParams {
+  ticketId: string;
+  lots?: number;
+  // Add other params if your ITradeExecutionProvider->closeOrder expects more
+}
+
 
 export class TradingService {
   private static instance: TradingService;
-  // Remove WebSocket simulation as we'll use polling for now
-  // private priceSocket: WebSocket | null = null;
   private priceCallbacks: ((price: number) => void)[] = [];
-  private priceUpdateInterval: any | null = null; // To store interval ID
+  private priceUpdateInterval: any | null = null;
 
   static getInstance(): TradingService {
     if (!TradingService.instance) {
@@ -19,7 +61,7 @@ export class TradingService {
     return TradingService.instance;
   }
 
-  // Trading Account Management
+  // --- Trading Account Management ---
   async addTradingAccount(accountData: {
     platform: 'MT4' | 'MT5';
     serverName: string;
@@ -28,7 +70,6 @@ export class TradingService {
     userId: string;
   }) {
     const encryptedPassword = await this.encryptPassword(accountData.password);
-    
     const { data, error } = await supabase
       .from('trading_accounts')
       .insert({
@@ -36,405 +77,291 @@ export class TradingService {
         platform: accountData.platform,
         server_name: accountData.serverName,
         login_id: accountData.loginId,
-        password_encrypted: encryptedPassword
+        password_encrypted: encryptedPassword,
       })
       .select()
       .single();
-
-    if (!error && data) {
-      await this.testConnection(data.id);
-    }
+    if (!error && data) { await this.testConnection(data.id); }
     return { data, error };
   }
 
   async getTradingAccounts(userId: string) {
-    const { data, error } = await supabase
-      .from('trading_accounts')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('is_active', true);
-    return { data, error };
+    return supabase.from('trading_accounts').select('*').eq('user_id', userId).eq('is_active', true);
   }
 
-  async updateAccountBalance(accountId: string, balanceData: {
-    account_balance: number;
-    equity: number;
-    margin: number;
-    free_margin: number;
-  }) {
-    const { data, error } = await supabase
-      .from('trading_accounts')
-      .update({
-        ...balanceData,
-        last_sync: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', accountId)
-      .select()
-      .single();
-    return { data, error };
-  }
-
-  // Trading Operations
-  async executeTrade(tradeData: {
+  // --- Bot Session Management ---
+  async startBot(params: {
     userId: string;
     tradingAccountId: string;
-    symbol: string;
-    tradeType: 'BUY' | 'SELL';
-    lotSize: number;
-    stopLoss?: number;
-    takeProfit?: number;
+    riskLevel: 'conservative' | 'medium' | 'risky';
+    strategySelectionMode: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'BREAKOUT_ONLY';
+    strategyParams: StrategyParams;
   }) {
     try {
-      const currentPrice = await this.getCurrentPrice(tradeData.symbol);
-      if (currentPrice === null) { // Check if price fetch failed
-        throw new Error("Could not fetch current price to execute trade.");
-      }
-      
-      const ticketId = this.generateTicketId();
-      const { data: trade, error } = await supabase
-        .from('trades')
+      const { data, error } = await supabase
+        .from('bot_sessions')
         .insert({
-          user_id: tradeData.userId,
-          trading_account_id: tradeData.tradingAccountId,
-          ticket_id: ticketId,
-          symbol: tradeData.symbol,
-          trade_type: tradeData.tradeType,
-          lot_size: tradeData.lotSize,
-          open_price: currentPrice,
-          stop_loss: tradeData.stopLoss,
-          take_profit: tradeData.takeProfit,
-          status: 'open'
+          user_id: params.userId,
+          trading_account_id: params.tradingAccountId,
+          risk_level: params.riskLevel,
+          strategy_selection_mode: params.strategySelectionMode,
+          strategy_params: params.strategyParams,
+          status: 'active',
+          session_start: new Date().toISOString(),
         })
         .select()
         .single();
 
       if (error) throw error;
-      await this.sendTradeToMT(trade); // Still simulated
-      await this.createTradeNotification(tradeData.userId, trade);
-      return { data: trade, error: null };
-    } catch (error) {
-      console.error('Error executing trade:', error);
+      console.log('Bot session started:', data);
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error starting bot session:', error);
       return { data: null, error };
     }
   }
 
-  async closeTrade(tradeId: string, closePriceInput?: number) {
+  async stopBot(sessionId: string) {
     try {
-      const { data: trade, error: fetchError } = await supabase
-        .from('trades')
-        .select('*')
-        .eq('id', tradeId)
-        .single();
-
-      if (fetchError || !trade) throw fetchError;
-
-      const finalClosePrice = closePriceInput ?? await this.getCurrentPrice(trade.symbol);
-      if (finalClosePrice === null) { // Check if price fetch failed
-         throw new Error("Could not fetch current price to close trade.");
-      }
-      const profitLoss = this.calculateProfitLoss(trade, finalClosePrice);
-
       const { data, error } = await supabase
-        .from('trades')
-        .update({
-          close_price: finalClosePrice,
-          profit_loss: profitLoss,
-          status: 'closed',
-          close_time: new Date().toISOString()
-        })
-        .eq('id', tradeId)
+        .from('bot_sessions')
+        .update({ status: 'stopped', session_end: new Date().toISOString() })
+        .eq('id', sessionId)
         .select()
         .single();
-
-      if (!error && data) {
-        await this.createTradeNotification(trade.user_id, data, 'closed');
-      }
-      return { data, error };
-    } catch (error) {
-      console.error('Error closing trade:', error);
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error stopping bot session:', error);
       return { data: null, error };
     }
   }
 
-  async getUserTrades(userId: string, limit = 50) {
-    const { data, error } = await supabase
-      .from('trades')
-      .select(`
-        *,
-        trading_accounts (
-          platform,
-          server_name
-        )
-      `)
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    return { data, error };
-  }
-
-  // Bot Session Management
-  async startBotSession(sessionData: {
-    userId: string;
-    tradingAccountId: string;
-    riskLevel: 'conservative' | 'medium' | 'risky';
-    settings: any;
-  }) {
-    const { data, error } = await supabase
-      .from('bot_sessions')
-      .insert({
-        user_id: sessionData.userId,
-        trading_account_id: sessionData.tradingAccountId,
-        risk_level: sessionData.riskLevel,
-        settings: sessionData.settings,
-        status: 'active'
-      })
-      .select()
-      .single();
-
-    if (!error) {
-      this.initializeBotLogic(data); // Placeholder
+  async getActiveUserBotSessions(userId: string): Promise<{ data: BotSession[] | null; error: any }> {
+    try {
+      const { data, error } = await supabase
+        .from('bot_sessions')
+        .select('*, trading_accounts(server_name, platform)')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('session_start', { ascending: false });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error fetching active bot sessions:', error);
+      return { data: null, error };
     }
-    return { data, error };
   }
 
-  async stopBotSession(sessionId: string) {
-    const { data, error } = await supabase
-      .from('bot_sessions')
-      .update({
-        status: 'stopped',
-        session_end: new Date().toISOString()
-      })
-      .eq('id', sessionId)
-      .select()
-      .single();
-    return { data, error };
+  // --- Provider-based Actions (from trading-engine) ---
+  async getProviderAccountSummary(tradingAccountId?: string) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'provider_get_account_summary', data: { tradingAccountId } },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error fetching account summary via provider:', error);
+      return { data: null, error };
+    }
   }
 
-  async getBotSession(userId: string) {
-    const { data, error } = await supabase
-      .from('bot_sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .single();
-    return { data, error };
+  async listProviderOpenPositions(tradingAccountId?: string) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'provider_list_open_positions', data: { tradingAccountId } },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error listing open positions via provider:', error);
+      return { data: null, error };
+    }
   }
 
-  // Price Data Management
-  async getCurrentPrice(_symbol: string = 'XAUUSD'): Promise<number | null> { // Ensure symbol is used if becomes relevant
+  async closeTradeOrderProvider(params: CloseOrderProviderParams) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'provider_close_order', data: params },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error closing order via provider:', error);
+      return { data: null, error };
+    }
+  }
+
+  async fetchProviderServerTime() {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'provider_get_server_time', data: {} },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error fetching server time via provider:', error);
+      return { data: null, error };
+    }
+  }
+
+  // --- User Trades (from `trades` table, typically for simulated trades) ---
+  async getUserTrades(userId: string, limit = 50) {
+    return supabase.from('trades').select('*, trading_accounts(platform, server_name)').eq('user_id', userId).order('created_at', { ascending: false }).limit(limit);
+  }
+
+
+  // --- Notification Methods ---
+  async getUserNotifications(userId: string, limit = 20): Promise<{ data: Notification[] | null; error: any }> {
+    try {
+      const { data, error } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error fetching user notifications:', error);
+      return { data: null, error };
+    }
+  }
+
+  async markNotificationAsRead(notificationId: string) {
+    try {
+      const { data, error } = await supabase
+        .from('notifications')
+        .update({ is_read: true, updated_at: new Date().toISOString() })
+        .eq('id', notificationId)
+        .select()
+        .single();
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) {
+      console.error('Error marking notification as read:', error);
+      return { data: null, error };
+    }
+  }
+
+  // --- Price Data Management ---
+  async getCurrentPrice(_symbol: string = 'XAUUSD'): Promise<number | null> {
     try {
       const { data, error } = await supabase.functions.invoke('trading-engine', {
         body: { action: 'get_current_price_action' },
       });
-
-      if (error) {
-        console.error('Error invoking trading-engine for price:', error);
-        throw error;
-      }
-
-      if (data && typeof data.price === 'number') {
-        return data.price;
-      } else {
-        console.error('Invalid price data received from trading-engine:', data);
-        return null; // Fallback or indicate error
-      }
-    } catch (error) {
-      console.error('Error fetching current price from backend:', error);
-      return null; // Fallback or indicate error
-    }
+      if (error) { console.error('Error invoking trading-engine for price:', error); throw error; }
+      if (data && typeof data.price === 'number') { return data.price; }
+      else { console.error('Invalid price data received:', data); return null; }
+    } catch (error: any) { console.error('Error fetching current price:', error); return null; }
   }
 
-  async storePriceData(priceData: {
-    symbol: string;
-    timestamp: string;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume?: number;
-    timeframe?: string;
-  }) {
-    const { data, error } = await supabase
-      .from('price_data')
-      .insert({
-        symbol: priceData.symbol,
-        timestamp: priceData.timestamp,
-        open_price: priceData.open,
-        high_price: priceData.high,
-        low_price: priceData.low,
-        close_price: priceData.close,
-        volume: priceData.volume || 0,
-        timeframe: priceData.timeframe as any || '1m'
-      });
-    return { data, error };
-  }
-
-  async getPriceHistory(symbol: string = 'XAUUSD', timeframe: string = '1h', limit = 100) {
-    const { data, error } = await supabase
-      .from('price_data')
-      .select('*')
-      .eq('symbol', symbol)
-      .eq('timeframe', timeframe)
-      .order('timestamp', { ascending: false })
-      .limit(limit);
-    return { data, error };
-  }
-
-  // Backtesting Service Methods
-  async runBacktest(params: {
-    userId?: string; // Optional for now, but good to include for future user-specific reports
-    symbol?: string;
-    timeframe?: string;
-    startDate: string; // ISO date string
-    endDate: string;   // ISO date string
-    strategySettings?: any;
-    riskSettings?: any;
-  }) {
-    try {
-      const { data, error } = await supabase.functions.invoke('trading-engine', {
-        body: {
-          action: 'run_backtest_action',
-          data: params
-        },
-      });
-      if (error) throw error;
-      return { data, error: null };
-    } catch (error) {
-      console.error('Error running backtest:', error);
-      return { data: null, error };
-    }
-  }
-
-  async getBacktestReport(reportId: string) {
-    try {
-      const { data, error } = await supabase.functions.invoke('trading-engine', {
-        body: {
-          action: 'get_backtest_report_action',
-          data: { reportId }
-        },
-      });
-      if (error) throw error;
-      return { data, error: null };
-    } catch (error) {
-      console.error('Error fetching backtest report:', error);
-      return { data: null, error };
-    }
-  }
-
-  async listBacktests(userId?: string) { // Optional userId
-    try {
-      const { data, error } = await supabase.functions.invoke('trading-engine', {
-        body: {
-          action: 'list_backtests_action',
-          data: { userId } // Pass userId, backend handles if it's null/undefined
-        },
-      });
-      if (error) throw error;
-      return { data, error: null };
-    } catch (error) {
-      console.error('Error listing backtests:', error);
-      return { data: null, error };
-    }
-  }
-
-  async fetchHistoricalData(params: {
+  async fetchHistoricalData(params: { // For populating backtest data
     symbol?: string;
     fromCurrency?: string;
     toCurrency?: string;
     interval?: string;
     outputsize?: string;
   }) {
-    try {
+     try {
       const { data, error } = await supabase.functions.invoke('trading-engine', {
-        body: {
-          action: 'fetch_historical_data_action',
-          data: params
-        }
+        body: { action: 'fetch_historical_data_action', data: params }
       });
       if (error) throw error;
       return { data, error: null };
-    } catch (error) {
-      console.error('Error fetching historical data:', error);
-      return { data: null, error };
-    }
+    } catch (error: any) { console.error('Error fetching historical data:', error); return { data: null, error };}
+   }
+
+  // --- Backtesting Service Methods ---
+  async runBacktest(params: {
+    userId?: string;
+    symbol?: string;
+    timeframe?: string;
+    startDate: string;
+    endDate: string;
+    strategySelectionMode: 'ADAPTIVE' | 'SMA_ONLY' | 'MEAN_REVERSION_ONLY' | 'BREAKOUT_ONLY';
+    strategyParams: StrategyParams;
+    riskSettings: { // Keep general risk settings separate if needed by backend
+        riskLevel?: 'conservative' | 'medium' | 'risky';
+        maxLotSize?: number; // This might be derived from riskLevel on backend too
+    };
+  }) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'run_backtest_action', data: params },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) { console.error('Error running backtest:', error); return { data: null, error };}
   }
 
+  async getBacktestReport(reportId: string) {
+     try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: {  action: 'get_backtest_report_action', data: { reportId }  },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) { console.error('Error fetching backtest report:', error); return { data: null, error };}
+  }
 
-  // Real-time Price Updates (Polling the backend)
+  async listBacktests(userId?: string) {
+    try {
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'list_backtests_action', data: { userId } },
+      });
+      if (error) throw error;
+      return { data, error: null };
+    } catch (error: any) { console.error('Error listing backtests:', error); return { data: null, error };}
+  }
+
+  // --- Real-time Price Updates (Polling) ---
   subscribeToPriceUpdates(callback: (price: number) => void) {
     this.priceCallbacks.push(callback);
-    
-    if (!this.priceUpdateInterval) { // Only start interval if not already running
-      this.initializePricePolling();
-    }
+    if (!this.priceUpdateInterval) { this.initializePricePolling(); }
   }
 
   unsubscribeFromPriceUpdates(callback: (price: number) => void) {
     this.priceCallbacks = this.priceCallbacks.filter(cb => cb !== callback);
-    
     if (this.priceCallbacks.length === 0 && this.priceUpdateInterval) {
       clearInterval(this.priceUpdateInterval);
       this.priceUpdateInterval = null;
     }
   }
 
-  // Private Methods
+  // --- Private Methods ---
   private async encryptPassword(password: string): Promise<string> {
-    // DEPRECATED: Storing or directly handling user passwords for external platforms like MT4/MT5
-    // is highly discouraged due to security risks.
-    // For broker API keys, they should be stored encrypted at rest (e.g., using Supabase Vault or AES-256 encryption)
-    // and managed server-side, not passed through or stored in the client if possible.
-    // This function is a placeholder and should not be used for real credential handling.
     console.warn("encryptPassword method is a placeholder and should not be used for production credentials.");
-    return `placeholder-for-${password}`; // Return a non-sensitive placeholder
+    return `placeholder-for-${password}`;
   }
-
-  private async testConnection(_accountId: string): Promise<boolean> { // accountId not used
+  private async testConnection(_accountId: string): Promise<boolean> {
     await new Promise(resolve => setTimeout(resolve, 1000));
     return Math.random() > 0.1;
   }
-
   private generateTicketId(): string {
     return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
   }
-
-  private async sendTradeToMT(_trade: Trade): Promise<void> { // trade not used
-    console.log('Simulating sending trade to MT platform...');
+  private async sendTradeToMT(_trade: Trade): Promise<void> { // kept for legacy executeTrade
+    console.log('Simulating sending legacy trade to MT platform...');
   }
-
-  private calculateProfitLoss(trade: Trade, closePrice: number): number {
-    const priceDiff = trade.trade_type === 'BUY' 
-      ? closePrice - (trade.open_price ?? 0) // Handle null open_price defensively
-      : (trade.open_price ?? 0) - closePrice;
-    return priceDiff * (trade.lot_size ?? 0) * 100; // Handle null lot_size
+  private calculateProfitLoss(trade: Trade, closePrice: number): number { // kept for legacy closeTrade
+    const priceDiff = trade.trade_type === 'BUY' ? closePrice - (trade.open_price ?? 0) : (trade.open_price ?? 0) - closePrice;
+    return priceDiff * (trade.lot_size ?? 0) * 100;
   }
-
   private async createTradeNotification(userId: string, trade: Trade, action: 'opened' | 'closed' = 'opened') {
-    const title = `Trade ${action.charAt(0).toUpperCase() + action.slice(1)}`;
-    // Ensure trade.open_price is defined before using it in message
-    const message = `${trade.trade_type} ${trade.lot_size} lots of ${trade.symbol} ${action === 'opened' ? `at ${trade.open_price}` : ''}`;
-
-    await supabase.from('notifications').insert({
-      user_id: userId,
-      type: 'trade_alert',
-      title,
-      message
-    });
+     const title = `Trade ${action.charAt(0).toUpperCase() + action.slice(1)} (Legacy)`;
+     const message = `${trade.trade_type} ${trade.lot_size} lots of ${trade.symbol} ${action === 'opened' ? `at ${trade.open_price}` : ''}`;
+     await supabase.from('notifications').insert({ user_id: userId, type: 'trade_alert', title, message });
   }
-
-  private initializeBotLogic(_session: BotSession) { // session not used
-    console.log('Simulating initializing bot session logic...');
+  private initializeBotLogic(_session: BotSession) {
+    console.log('Simulating initializing bot session logic (from tradingService)...');
   }
-
   private initializePricePolling() {
-    // Poll the backend for price updates
     this.priceUpdateInterval = setInterval(async () => {
-      const price = await this.getCurrentPrice(); // Fetches from backend
-      if (price !== null) {
-        this.priceCallbacks.forEach(callback => callback(price));
-      }
-    }, 15000); // Poll every 15 seconds - adjust as needed, mindful of function invocation costs
+      const price = await this.getCurrentPrice();
+      if (price !== null) { this.priceCallbacks.forEach(callback => callback(price)); }
+    }, 15000);
   }
 }
 
