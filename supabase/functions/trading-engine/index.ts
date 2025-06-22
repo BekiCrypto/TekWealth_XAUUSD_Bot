@@ -66,6 +66,16 @@ serve(async (req) => {
       case 'list_backtests_action':
         return await listBacktestsAction(supabaseClient, data);
 
+      // New provider actions
+      case 'provider_close_order':
+        return await handleProviderCloseOrder(supabaseClient, data, alphaVantageApiKey);
+      case 'provider_get_account_summary':
+        return await handleProviderGetAccountSummary(supabaseClient, data, alphaVantageApiKey);
+      case 'provider_list_open_positions':
+        return await handleProviderListOpenPositions(supabaseClient, data, alphaVantageApiKey);
+      case 'provider_get_server_time':
+        return await handleProviderGetServerTime(supabaseClient, data, alphaVantageApiKey);
+
       default:
         throw new Error(`Unknown action: ${action}`)
     }
@@ -108,6 +118,55 @@ async function fetchCurrentGoldPriceFromAPI(apiKey: string): Promise<number> {
     throw error; // Re-throw if no usable cache
   }
 }
+
+// --- Action Handlers for ITradeExecutionProvider methods ---
+// Helper to get the configured trade provider
+function getTradeProvider(supabase: any, alphaVantageApiKeyForSimulated: string): ITradeExecutionProvider {
+  const providerType = Deno.env.get('TRADE_PROVIDER_TYPE')?.toUpperCase() || 'SIMULATED';
+  if (providerType === 'METATRADER') {
+    const bridgeUrl = Deno.env.get('MT_BRIDGE_URL');
+    const bridgeApiKeyEnv = Deno.env.get('MT_BRIDGE_API_KEY');
+    if (!bridgeUrl || !bridgeApiKeyEnv) {
+      console.warn("MetaTrader provider configured but URL or API key missing. Falling back to SIMULATED.");
+      return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
+    }
+    return new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKeyEnv);
+  }
+  return new SimulatedTradeProvider(supabase, alphaVantageApiKeyForSimulated);
+}
+
+async function handleProviderCloseOrder(supabase: any, data: any, alphaVantageApiKey: string) {
+  const provider = getTradeProvider(supabase, alphaVantageApiKey);
+  const { ticketId, lots, price, slippage } = data; // data should be CloseOrderParams
+  if (!ticketId) {
+    return new Response(JSON.stringify({ error: "ticketId is required to close an order." }), {
+      status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+  const result = await provider.closeOrder({ ticketId, lots, price, slippage });
+  return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+}
+
+async function handleProviderGetAccountSummary(supabase: any, data: any, alphaVantageApiKey: string) {
+  const provider = getTradeProvider(supabase, alphaVantageApiKey);
+  const { tradingAccountId } = data; // Optional: for simulated provider context
+  const result = await provider.getAccountSummary(tradingAccountId);
+  return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+}
+
+async function handleProviderListOpenPositions(supabase: any, data: any, alphaVantageApiKey: string) {
+  const provider = getTradeProvider(supabase, alphaVantageApiKey);
+  const { tradingAccountId } = data; // Optional: for simulated provider context
+  const result = await provider.getOpenPositions(tradingAccountId);
+  return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+}
+
+async function handleProviderGetServerTime(supabase: any, _data: any, alphaVantageApiKey: string) {
+  const provider = getTradeProvider(supabase, alphaVantageApiKey);
+  const result = await provider.getServerTime();
+  return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
+}
+// --- End Action Handlers ---
 
 // --- Email Sending Helper ---
 async function sendEmail(
@@ -684,21 +743,76 @@ interface ExecuteOrderResult {
   error?: string;
 }
 
-// We can expand this interface later with closeOrder, modifyOrder, etc.
+// --- Enhanced Trade Execution Abstraction ---
+// Parameter and Result Types
+interface CloseOrderParams {
+  ticketId: string; // The ticket ID of the order to close
+  lots?: number; // Optional: specific lots to close for partial closure
+  price?: number; // Optional: price at which to attempt closure (for limit/stop on close)
+  slippage?: number; // Optional
+  // userId and tradingAccountId might be needed if the provider needs context
+  // or if the trades table isn't solely reliant on ticketId for identification.
+}
+
+interface CloseOrderResult {
+  success: boolean;
+  ticketId: string;
+  closePrice?: number;
+  profit?: number;
+  error?: string;
+}
+
+interface AccountSummary {
+  balance: number;
+  equity: number;
+  margin: number;
+  freeMargin: number;
+  currency: string;
+  error?: string;
+}
+
+interface OpenPosition {
+  ticket: string; // Using string to be consistent with ExecuteOrderResult's ticketId
+  symbol: string;
+  type: 'BUY' | 'SELL';
+  lots: number;
+  openPrice: number;
+  openTime: string;
+  stopLoss?: number;
+  takeProfit?: number;
+  currentPrice?: number; // Current market price
+  profit?: number; // Current floating profit/loss
+  swap?: number;
+  comment?: string;
+}
+
+interface ServerTime {
+  time: string; // ISO format ideally, or as provided by broker
+  error?: string;
+}
+
+
+// Expanded Interface
 interface ITradeExecutionProvider {
   executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult>;
+  closeOrder(params: CloseOrderParams): Promise<CloseOrderResult>;
+  getAccountSummary(accountId?: string): Promise<AccountSummary>; // accountId for simulated if multiple
+  getOpenPositions(accountId?: string): Promise<OpenPosition[]>; // accountId for simulated
+  getServerTime(): Promise<ServerTime>;
 }
 
 class SimulatedTradeProvider implements ITradeExecutionProvider {
   private supabase: any;
+  private apiKey: string;
 
-  constructor(supabaseClient: any) {
+  constructor(supabaseClient: any, alphaVantageApiKey: string) {
     this.supabase = supabaseClient;
+    this.apiKey = alphaVantageApiKey; // Store apiKey for getCurrentGoldPrice
   }
 
   async executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
     try {
-      const ticketId = generateTicketId(); // Ensure generateTicketId() is accessible or passed
+      const ticketId = generateTicketId();
       const { data: dbTrade, error } = await this.supabase
         .from('trades')
         .insert({
@@ -732,8 +846,261 @@ class SimulatedTradeProvider implements ITradeExecutionProvider {
       return { success: false, error: e.message };
     }
   }
+
+  async closeOrder(params: CloseOrderParams): Promise<CloseOrderResult> {
+    const { ticketId } = params; // Ignoring lots, price for simple market close simulation
+    try {
+      const currentPrice = await getCurrentGoldPrice(this.apiKey); // Assumes XAUUSD for now
+
+      // Fetch the trade to get its details
+      const { data: tradeToClose, error: fetchError } = await this.supabase
+        .from('trades')
+        .select('*')
+        // .eq('ticket_id', ticketId) // If ticket_id is unique and indexed for lookup
+        .eq('id', ticketId) // Assuming ticketId passed is the DB UUID 'id'
+        .eq('status', 'open')
+        .single();
+
+      if (fetchError) throw new Error(`Error fetching trade to close: ${fetchError.message}`);
+      if (!tradeToClose) return { success: false, ticketId, error: "Open trade with specified ID not found." };
+
+      const priceDiff = tradeToClose.trade_type === 'BUY'
+        ? currentPrice - tradeToClose.open_price
+        : tradeToClose.open_price - currentPrice;
+      const profitLoss = priceDiff * tradeToClose.lot_size * 100; // Simplified P&L
+
+      const { error: updateError } = await this.supabase
+        .from('trades')
+        .update({
+          close_price: currentPrice,
+          profit_loss: profitLoss,
+          status: 'closed',
+          close_time: new Date().toISOString(),
+        })
+        // .eq('ticket_id', ticketId);
+        .eq('id', ticketId);
+
+
+      if (updateError) throw new Error(`Error updating trade to closed: ${updateError.message}`);
+
+      return {
+        success: true,
+        ticketId,
+        closePrice: currentPrice,
+        profit: parseFloat(profitLoss.toFixed(2))
+      };
+    } catch (e) {
+      console.error('SimulatedTradeProvider: Exception in closeOrder:', e);
+      return { success: false, ticketId, error: e.message };
+    }
+  }
+
+  async getAccountSummary(_accountId?: string): Promise<AccountSummary> {
+    // This is a very basic simulation. A real one might calculate from trades or a balance table.
+    // For now, let's assume it fetches from `trading_accounts` if an `accountId` (DB UUID) is provided
+    if (_accountId) {
+        const {data, error} = await this.supabase
+            .from('trading_accounts')
+            .select('account_balance, equity, margin, free_margin, currency')
+            .eq('id', _accountId)
+            .single();
+        if (error || !data) {
+            console.error("SimulatedTradeProvider: Error fetching account summary from DB", error);
+            return { balance: 0, equity: 0, margin: 0, freeMargin: 0, currency: 'USD', error: "Account not found or error."};
+        }
+        return {
+            balance: data.account_balance || 0,
+            equity: data.equity || 0,
+            margin: data.margin || 0,
+            freeMargin: data.free_margin || 0,
+            currency: data.currency || 'USD'
+        };
+    }
+    // Fallback static data if no accountId
+    return { balance: 10000, equity: 10000, margin: 0, freeMargin: 10000, currency: 'USD' };
+  }
+
+  async getOpenPositions(accountId?: string): Promise<OpenPosition[]> {
+    // Fetches from 'trades' table where status is 'open'
+    // If accountId (DB UUID of trading_accounts) is provided, filter by it.
+    try {
+      let query = this.supabase.from('trades').select('*').eq('status', 'open');
+      if (accountId) {
+        query = query.eq('trading_account_id', accountId);
+      }
+      const { data, error } = await query;
+
+      if (error) throw error;
+
+      return (data || []).map(t => ({
+        ticket: t.id, // Using DB id as the ticket for consistency here
+        symbol: t.symbol,
+        type: t.trade_type,
+        lots: t.lot_size,
+        openPrice: t.open_price,
+        openTime: t.created_at, // or open_time if you have it
+        stopLoss: t.stop_loss,
+        takeProfit: t.take_profit,
+        // currentPrice and profit would require fetching live price and calculating
+        comment: t.bot_session_id ? `BotSess:${t.bot_session_id}` : ''
+      }));
+    } catch (e) {
+      console.error('SimulatedTradeProvider: Exception in getOpenPositions:', e);
+      return [];
+    }
+  }
+
+  async getServerTime(): Promise<ServerTime> {
+    return { time: new Date().toISOString() };
+  }
 }
 // --- End Trade Execution Abstraction ---
+
+// --- MetaTrader Bridge Provider ---
+// This class is INTENDED to communicate with an external EA bridge.
+// The actual HTTP calls are placeholders and would need to be robustly implemented.
+class MetaTraderBridgeProvider implements ITradeExecutionProvider {
+  private bridgeUrl: string;
+  private bridgeApiKey: string;
+
+  constructor(bridgeUrl: string, bridgeApiKey: string) {
+    if (!bridgeUrl || !bridgeApiKey) {
+      throw new Error("MetaTraderBridgeProvider: bridgeUrl and bridgeApiKey are required.");
+    }
+    this.bridgeUrl = bridgeUrl.endsWith('/') ? bridgeUrl.slice(0, -1) : bridgeUrl; // Ensure no trailing slash
+    this.bridgeApiKey = bridgeApiKey;
+  }
+
+  private async makeRequest(endpoint: string, method: string, body?: any): Promise<any> {
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-MT-Bridge-API-Key': this.bridgeApiKey,
+    };
+    try {
+      const response = await fetch(`${this.bridgeUrl}${endpoint}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: "Failed to parse error response from bridge" }));
+        console.error(`MetaTraderBridgeProvider Error: ${response.status} ${response.statusText}`, errorData);
+        throw new Error(`Bridge API Error (${endpoint}): ${response.status} - ${errorData.error || response.statusText}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error(`MetaTraderBridgeProvider Request Failed (${endpoint}):`, error);
+      throw error; // Re-throw to be handled by the caller
+    }
+  }
+
+  async executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
+    try {
+      const requestBody = {
+        symbol: params.symbol,
+        type: params.tradeType,
+        lots: params.lotSize,
+        price: params.openPrice, // For market order, price might be ignored by EA, or used for deviation checks
+        stopLossPrice: params.stopLossPrice,
+        takeProfitPrice: params.takeProfitPrice,
+        magicNumber: params.botSessionId ? parseInt(params.botSessionId.replace(/\D/g,'').slice(-7)) || 0 : 0, // Example: extract numbers from session ID
+        comment: `BotTrade_Sess${params.botSessionId || 'N/A'}`,
+      };
+
+      // Assuming the API contract defined: POST /order/execute
+      const responseData = await this.makeRequest('/order/execute', 'POST', requestBody);
+
+      if (responseData.success && responseData.ticket) {
+        return {
+          success: true,
+          tradeId: responseData.ticket.toString(), // Assuming ticket is the primary ID from MT
+          ticketId: responseData.ticket.toString()
+        };
+      } else {
+        return { success: false, error: responseData.error || "Failed to execute order via bridge." };
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+  // Implement other ITradeExecutionProvider methods (getAccountSummary, etc.) here,
+  // each calling their respective endpoints on the EA bridge.
+  async closeOrder(params: CloseOrderParams): Promise<CloseOrderResult> {
+    try {
+      // Assuming API contract: POST /order/close
+      const responseData = await this.makeRequest('/order/close', 'POST', {
+        ticket: parseInt(params.ticketId), // EA bridge likely expects integer ticket
+        lots: params.lots,
+        // price: params.price, // If EA supports closing at a specific price
+        // slippage: params.slippage,
+      });
+      if (responseData.success) {
+        return {
+          success: true,
+          ticketId: params.ticketId,
+          closePrice: responseData.closePrice,
+          profit: responseData.profit
+        };
+      } else {
+        return { success: false, ticketId: params.ticketId, error: responseData.error || "Failed to close order via bridge." };
+      }
+    } catch (error) {
+      return { success: false, ticketId: params.ticketId, error: error.message };
+    }
+  }
+
+  async getAccountSummary(): Promise<AccountSummary> {
+    try {
+      // Assuming API contract: GET /account/summary
+      const data = await this.makeRequest('/account/summary', 'GET');
+      return {
+        balance: data.balance,
+        equity: data.equity,
+        margin: data.margin,
+        freeMargin: data.freeMargin,
+        currency: data.currency,
+      };
+    } catch (error) {
+      return { balance: 0, equity: 0, margin: 0, freeMargin: 0, currency: 'N/A', error: error.message };
+    }
+  }
+
+  async getOpenPositions(): Promise<OpenPosition[]> {
+     try {
+      // Assuming API contract: GET /positions/open
+      const data = await this.makeRequest('/positions/open', 'GET');
+      return (data.positions || []).map((p: any) => ({ // Map to OpenPosition interface
+          ticket: p.ticket.toString(),
+          symbol: p.symbol,
+          type: p.type,
+          lots: p.lots,
+          openPrice: p.openPrice,
+          openTime: p.openTime,
+          stopLoss: p.stopLoss,
+          takeProfit: p.takeProfit,
+          currentPrice: p.currentPrice,
+          profit: p.profit,
+          swap: p.swap,
+          comment: p.comment,
+      }));
+    } catch (error) {
+      console.error('MetaTraderBridgeProvider: Error fetching open positions:', error);
+      return [];
+    }
+  }
+
+  async getServerTime(): Promise<ServerTime> {
+    try {
+      // Assuming API contract: GET /server/time
+      const data = await this.makeRequest('/server/time', 'GET');
+      return { time: data.serverTime };
+    } catch (error) {
+      return { time: '', error: error.message };
+    }
+  }
+}
+// --- End MetaTrader Bridge Provider ---
 
 
 // Refactored for backtesting and live trading
@@ -819,8 +1186,24 @@ async function analyzeMarketConditions(
 async function processBotSession(supabase: any, session: any, apiKey: string) {
   console.log(`Processing bot session ${session.id} for user ${session.user_id} (Live Mode)`);
 
-  // Initialize the trade execution provider
-  const tradeProvider: ITradeExecutionProvider = new SimulatedTradeProvider(supabase);
+  let tradeProvider: ITradeExecutionProvider;
+  const providerType = Deno.env.get('TRADE_PROVIDER_TYPE')?.toUpperCase() || 'SIMULATED';
+
+  if (providerType === 'METATRADER') {
+    const bridgeUrl = Deno.env.get('MT_BRIDGE_URL');
+    const bridgeApiKey = Deno.env.get('MT_BRIDGE_API_KEY');
+    if (!bridgeUrl || !bridgeApiKey) {
+      console.error("MetaTrader provider selected, but MT_BRIDGE_URL or MT_BRIDGE_API_KEY is not set. Falling back to SIMULATED.");
+      tradeProvider = new SimulatedTradeProvider(supabase, apiKey); // apiKey for AlphaVantage for simulated close price
+    } else {
+      console.log(`Using MetaTraderBridgeProvider with URL: ${bridgeUrl}`);
+      tradeProvider = new MetaTraderBridgeProvider(bridgeUrl, bridgeApiKey);
+    }
+  } else {
+    console.log("Using SimulatedTradeProvider.");
+    tradeProvider = new SimulatedTradeProvider(supabase, apiKey); // apiKey for AlphaVantage for simulated close price
+  }
+
 
   const riskSettingsMap = {
     conservative: { maxLotSize: 0.01, stopLossPips: 200 },
@@ -851,7 +1234,7 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
 
   // Call analyzeMarketConditions without backtesting parameters for live mode
   const analysisResult = await analyzeMarketConditions(apiKey, session.strategy_settings?.shortPeriod || 20, session.strategy_settings?.longPeriod || 50);
-  
+
   if (analysisResult.shouldTrade && analysisResult.tradeType && analysisResult.priceAtDecision) {
     const tradeType = analysisResult.tradeType;
     const openPrice = analysisResult.priceAtDecision;
@@ -864,7 +1247,7 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
     } else { // SELL
       stopLossPrice = openPrice + stopLossDistance;
     }
-    
+
     console.log(`Executing ${tradeType} for session ${session.id}: Price=${openPrice}, SL=${stopLossPrice}, Lot=${lotSize}`);
 
     const executionParams: ExecuteOrderParams = {
