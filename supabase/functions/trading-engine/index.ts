@@ -109,6 +109,60 @@ async function fetchCurrentGoldPriceFromAPI(apiKey: string): Promise<number> {
   }
 }
 
+// --- Email Sending Helper ---
+async function sendEmail(
+  to: string,
+  subject: string,
+  htmlContent: string
+): Promise<{ success: boolean; error?: string; messageId?: string }> {
+  const sendGridApiKey = Deno.env.get('SENDGRID_API_KEY');
+  const fromEmail = Deno.env.get('FROM_EMAIL');
+
+  if (!sendGridApiKey) {
+    console.error('SENDGRID_API_KEY environment variable is not set. Cannot send email.');
+    return { success: false, error: 'SendGrid API Key not configured.' };
+  }
+  if (!fromEmail) {
+    console.error('FROM_EMAIL environment variable is not set. Cannot send email.');
+    return { success: false, error: 'Sender email (FROM_EMAIL) not configured.' };
+  }
+
+  const emailData = {
+    personalizations: [{ to: [{ email: to }] }],
+    from: { email: fromEmail, name: 'TekWealth Trading Bot' }, // Optional: Add a sender name
+    subject: subject,
+    content: [{ type: 'text/html', value: htmlContent }],
+  };
+
+  try {
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sendGridApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(emailData),
+    });
+
+    if (response.status === 202) { // SendGrid returns 202 Accepted on success
+      console.log(`Email sent successfully to ${to}. Subject: ${subject}`);
+      // SendGrid does not return a message ID in the V3 mail/send response body directly for 202.
+      // It's available via X-Message-Id header, which we can try to get if needed, or via event webhooks.
+      // For simplicity, we'll just confirm success based on status.
+      const messageId = response.headers.get('x-message-id');
+      return { success: true, messageId: messageId || undefined };
+    } else {
+      const errorBody = await response.json();
+      console.error(`Failed to send email. Status: ${response.status}`, errorBody);
+      return { success: false, error: `SendGrid API Error: ${response.status} - ${JSON.stringify(errorBody)}` };
+    }
+  } catch (error) {
+    console.error('Error sending email via SendGrid:', error);
+    return { success: false, error: error.message };
+  }
+}
+// --- End Email Sending Helper ---
+
 interface SimulatedTrade {
   entryTime: string;
   entryPrice: number;
@@ -318,6 +372,34 @@ async function runBacktestAction(supabase: any, data: any, apiKey: string) {
         created_at: report.created_at, // Add created_at from DB
         trades: tradesForDb // Return the trades array as computed (before DB mapping)
     };
+
+    // Send email notification for backtest completion
+    const recipientEmail = Deno.env.get('NOTIFICATION_EMAIL_RECIPIENT');
+    if (recipientEmail) {
+      const emailSubject = `[Trading Bot] Backtest Completed: Report ID ${reportId}`;
+      const emailHtmlContent = `
+        <h1>Backtest Completed</h1>
+        <p>A backtest has successfully completed. Details:</p>
+        <ul>
+          <li>Report ID: ${reportId}</li>
+          <li>Symbol: ${reportSummary.symbol}</li>
+          <li>Timeframe: ${reportSummary.timeframe}</li>
+          <li>Period: ${new Date(reportSummary.start_date).toLocaleDateString()} - ${new Date(reportSummary.end_date).toLocaleDateString()}</li>
+          <li>Total Trades: ${reportSummary.total_trades}</li>
+          <li>Total P/L: $${reportSummary.total_profit_loss}</li>
+          <li>Win Rate: ${reportSummary.win_rate}%</li>
+        </ul>
+        <p>Full details and trade list are available in the application.</p>
+      `;
+      sendEmail(recipientEmail, emailSubject, emailHtmlContent)
+        .then(emailRes => {
+          if (emailRes.success) console.log(`Backtest completion email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
+          else console.error(`Failed to send backtest completion email: ${emailRes.error}`);
+        })
+        .catch(err => console.error(`Exception while sending backtest completion email: ${err.message}`));
+    } else {
+      console.warn("NOTIFICATION_EMAIL_RECIPIENT not set. Skipping backtest completion email.");
+    }
 
     return new Response(JSON.stringify(finalResults), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -766,7 +848,7 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
     console.log(`Session ${session.id} for user ${session.user_id} already has ${openTrades.length} open trade(s). Skipping new trade.`);
     return;
   }
-  
+
   // Call analyzeMarketConditions without backtesting parameters for live mode
   const analysisResult = await analyzeMarketConditions(apiKey, session.strategy_settings?.shortPeriod || 20, session.strategy_settings?.longPeriod || 50);
   
@@ -811,6 +893,36 @@ async function processBotSession(supabase: any, session: any, apiKey: string) {
         .from('bot_sessions')
         .update({ total_trades: (session.total_trades || 0) + 1, last_trade_time: new Date().toISOString() })
         .eq('id', session.id);
+
+      // Send email notification
+      const recipientEmail = Deno.env.get('NOTIFICATION_EMAIL_RECIPIENT');
+      if (recipientEmail) {
+        const emailSubject = `[Trading Bot] Trade Executed: ${tradeType} ${lotSize} ${executionParams.symbol}`;
+        const emailHtmlContent = `
+          <h1>Trade Executed</h1>
+          <p>A trade was executed by the automated bot:</p>
+          <ul>
+            <li>Session ID: ${session.id}</li>
+            <li>User ID: ${session.user_id}</li>
+            <li>Symbol: ${executionParams.symbol}</li>
+            <li>Type: ${tradeType}</li>
+            <li>Lot Size: ${lotSize}</li>
+            <li>Open Price: $${openPrice.toFixed(4)}</li>
+            <li>Stop Loss: $${executionParams.stopLossPrice.toFixed(4)}</li>
+            <li>Database Trade ID: ${executionResult.tradeId}</li>
+            <li>Ticket ID: ${executionResult.ticketId}</li>
+          </ul>
+        `;
+        sendEmail(recipientEmail, emailSubject, emailHtmlContent)
+          .then(emailRes => {
+            if (emailRes.success) console.log(`Trade execution email sent to ${recipientEmail}, Message ID: ${emailRes.messageId}`);
+            else console.error(`Failed to send trade execution email: ${emailRes.error}`);
+          })
+          .catch(err => console.error(`Exception while sending trade execution email: ${err.message}`));
+      } else {
+        console.warn("NOTIFICATION_EMAIL_RECIPIENT not set. Skipping trade execution email.");
+      }
+
     } else {
       console.error(`Error executing trade for session ${session.id}:`, executionResult.error);
       await supabase.from('notifications').insert({
