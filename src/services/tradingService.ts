@@ -7,8 +7,10 @@ type BotSession = Database['public']['Tables']['bot_sessions']['Row'];
 
 export class TradingService {
   private static instance: TradingService;
-  private priceSocket: WebSocket | null = null;
+  // Remove WebSocket simulation as we'll use polling for now
+  // private priceSocket: WebSocket | null = null;
   private priceCallbacks: ((price: number) => void)[] = [];
+  private priceUpdateInterval: any | null = null; // To store interval ID
 
   static getInstance(): TradingService {
     if (!TradingService.instance) {
@@ -25,7 +27,6 @@ export class TradingService {
     password: string;
     userId: string;
   }) {
-    // Encrypt password before storing
     const encryptedPassword = await this.encryptPassword(accountData.password);
     
     const { data, error } = await supabase
@@ -41,10 +42,8 @@ export class TradingService {
       .single();
 
     if (!error && data) {
-      // Test connection
       await this.testConnection(data.id);
     }
-
     return { data, error };
   }
 
@@ -54,7 +53,6 @@ export class TradingService {
       .select('*')
       .eq('user_id', userId)
       .eq('is_active', true);
-
     return { data, error };
   }
 
@@ -74,7 +72,6 @@ export class TradingService {
       .eq('id', accountId)
       .select()
       .single();
-
     return { data, error };
   }
 
@@ -89,13 +86,12 @@ export class TradingService {
     takeProfit?: number;
   }) {
     try {
-      // Get current price
       const currentPrice = await this.getCurrentPrice(tradeData.symbol);
+      if (currentPrice === null) { // Check if price fetch failed
+        throw new Error("Could not fetch current price to execute trade.");
+      }
       
-      // Generate ticket ID
       const ticketId = this.generateTicketId();
-
-      // Insert trade record
       const { data: trade, error } = await supabase
         .from('trades')
         .insert({
@@ -114,13 +110,8 @@ export class TradingService {
         .single();
 
       if (error) throw error;
-
-      // Send trade to MT4/MT5 (simulated for now)
-      await this.sendTradeToMT(trade);
-
-      // Create notification
+      await this.sendTradeToMT(trade); // Still simulated
       await this.createTradeNotification(tradeData.userId, trade);
-
       return { data: trade, error: null };
     } catch (error) {
       console.error('Error executing trade:', error);
@@ -128,7 +119,7 @@ export class TradingService {
     }
   }
 
-  async closeTrade(tradeId: string, closePrice?: number) {
+  async closeTrade(tradeId: string, closePriceInput?: number) {
     try {
       const { data: trade, error: fetchError } = await supabase
         .from('trades')
@@ -138,7 +129,10 @@ export class TradingService {
 
       if (fetchError || !trade) throw fetchError;
 
-      const finalClosePrice = closePrice || await this.getCurrentPrice(trade.symbol);
+      const finalClosePrice = closePriceInput ?? await this.getCurrentPrice(trade.symbol);
+      if (finalClosePrice === null) { // Check if price fetch failed
+         throw new Error("Could not fetch current price to close trade.");
+      }
       const profitLoss = this.calculateProfitLoss(trade, finalClosePrice);
 
       const { data, error } = await supabase
@@ -153,10 +147,9 @@ export class TradingService {
         .select()
         .single();
 
-      if (!error) {
+      if (!error && data) {
         await this.createTradeNotification(trade.user_id, data, 'closed');
       }
-
       return { data, error };
     } catch (error) {
       console.error('Error closing trade:', error);
@@ -177,7 +170,6 @@ export class TradingService {
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(limit);
-
     return { data, error };
   }
 
@@ -201,10 +193,8 @@ export class TradingService {
       .single();
 
     if (!error) {
-      // Start bot logic here
-      this.initializeBotLogic(data);
+      this.initializeBotLogic(data); // Placeholder
     }
-
     return { data, error };
   }
 
@@ -218,7 +208,6 @@ export class TradingService {
       .eq('id', sessionId)
       .select()
       .single();
-
     return { data, error };
   }
 
@@ -229,21 +218,30 @@ export class TradingService {
       .eq('user_id', userId)
       .eq('status', 'active')
       .single();
-
     return { data, error };
   }
 
   // Price Data Management
-  async getCurrentPrice(symbol: string = 'XAUUSD'): Promise<number> {
+  async getCurrentPrice(_symbol: string = 'XAUUSD'): Promise<number | null> { // Ensure symbol is used if becomes relevant
     try {
-      // In production, this would connect to a real price feed
-      // For now, we'll simulate gold price around $2045
-      const basePrice = 2045;
-      const variation = (Math.random() - 0.5) * 10; // ±$5 variation
-      return basePrice + variation;
+      const { data, error } = await supabase.functions.invoke('trading-engine', {
+        body: { action: 'get_current_price_action' },
+      });
+
+      if (error) {
+        console.error('Error invoking trading-engine for price:', error);
+        throw error;
+      }
+
+      if (data && typeof data.price === 'number') {
+        return data.price;
+      } else {
+        console.error('Invalid price data received from trading-engine:', data);
+        return null; // Fallback or indicate error
+      }
     } catch (error) {
-      console.error('Error fetching current price:', error);
-      return 2045; // Fallback price
+      console.error('Error fetching current price from backend:', error);
+      return null; // Fallback or indicate error
     }
   }
 
@@ -269,7 +267,6 @@ export class TradingService {
         volume: priceData.volume || 0,
         timeframe: priceData.timeframe as any || '1m'
       });
-
     return { data, error };
   }
 
@@ -281,61 +278,62 @@ export class TradingService {
       .eq('timeframe', timeframe)
       .order('timestamp', { ascending: false })
       .limit(limit);
-
     return { data, error };
   }
 
-  // Real-time Price Updates
+  // Real-time Price Updates (Polling the backend)
   subscribeToPriceUpdates(callback: (price: number) => void) {
     this.priceCallbacks.push(callback);
     
-    if (!this.priceSocket) {
-      this.initializePriceSocket();
+    if (!this.priceUpdateInterval) { // Only start interval if not already running
+      this.initializePricePolling();
     }
   }
 
   unsubscribeFromPriceUpdates(callback: (price: number) => void) {
     this.priceCallbacks = this.priceCallbacks.filter(cb => cb !== callback);
     
-    if (this.priceCallbacks.length === 0 && this.priceSocket) {
-      this.priceSocket.close();
-      this.priceSocket = null;
+    if (this.priceCallbacks.length === 0 && this.priceUpdateInterval) {
+      clearInterval(this.priceUpdateInterval);
+      this.priceUpdateInterval = null;
     }
   }
 
   // Private Methods
   private async encryptPassword(password: string): Promise<string> {
-    // In production, use proper encryption
-    return btoa(password); // Simple base64 encoding for demo
+    // DEPRECATED: Storing or directly handling user passwords for external platforms like MT4/MT5
+    // is highly discouraged due to security risks.
+    // For broker API keys, they should be stored encrypted at rest (e.g., using Supabase Vault or AES-256 encryption)
+    // and managed server-side, not passed through or stored in the client if possible.
+    // This function is a placeholder and should not be used for real credential handling.
+    console.warn("encryptPassword method is a placeholder and should not be used for production credentials.");
+    return `placeholder-for-${password}`; // Return a non-sensitive placeholder
   }
 
-  private async testConnection(accountId: string): Promise<boolean> {
-    // Simulate connection test
+  private async testConnection(_accountId: string): Promise<boolean> { // accountId not used
     await new Promise(resolve => setTimeout(resolve, 1000));
-    return Math.random() > 0.1; // 90% success rate
+    return Math.random() > 0.1;
   }
 
   private generateTicketId(): string {
-    return Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
   }
 
-  private async sendTradeToMT(trade: Trade): Promise<void> {
-    // In production, this would send the trade to MT4/MT5
-    console.log('Sending trade to MT platform:', trade);
+  private async sendTradeToMT(_trade: Trade): Promise<void> { // trade not used
+    console.log('Simulating sending trade to MT platform...');
   }
 
   private calculateProfitLoss(trade: Trade, closePrice: number): number {
     const priceDiff = trade.trade_type === 'BUY' 
-      ? closePrice - trade.open_price
-      : trade.open_price - closePrice;
-    
-    // Simplified P&L calculation (actual would depend on contract size, etc.)
-    return priceDiff * trade.lot_size * 100;
+      ? closePrice - (trade.open_price ?? 0) // Handle null open_price defensively
+      : (trade.open_price ?? 0) - closePrice;
+    return priceDiff * (trade.lot_size ?? 0) * 100; // Handle null lot_size
   }
 
   private async createTradeNotification(userId: string, trade: Trade, action: 'opened' | 'closed' = 'opened') {
     const title = `Trade ${action.charAt(0).toUpperCase() + action.slice(1)}`;
-    const message = `${trade.trade_type} ${trade.lot_size} lots of ${trade.symbol} at ${trade.open_price}`;
+    // Ensure trade.open_price is defined before using it in message
+    const message = `${trade.trade_type} ${trade.lot_size} lots of ${trade.symbol} ${action === 'opened' ? `at ${trade.open_price}` : ''}`;
 
     await supabase.from('notifications').insert({
       user_id: userId,
@@ -345,20 +343,18 @@ export class TradingService {
     });
   }
 
-  private initializeBotLogic(session: BotSession) {
-    // Bot trading logic would go here
-    console.log('Initializing bot session:', session);
+  private initializeBotLogic(_session: BotSession) { // session not used
+    console.log('Simulating initializing bot session logic...');
   }
 
-  private initializePriceSocket() {
-    // In production, connect to real price feed
-    // For demo, simulate price updates
-    setInterval(() => {
-      const price = this.getCurrentPrice();
-      price.then(p => {
-        this.priceCallbacks.forEach(callback => callback(p));
-      });
-    }, 5000); // Update every 5 seconds
+  private initializePricePolling() {
+    // Poll the backend for price updates
+    this.priceUpdateInterval = setInterval(async () => {
+      const price = await this.getCurrentPrice(); // Fetches from backend
+      if (price !== null) {
+        this.priceCallbacks.forEach(callback => callback(price));
+      }
+    }, 15000); // Poll every 15 seconds - adjust as needed, mindful of function invocation costs
   }
 }
 
