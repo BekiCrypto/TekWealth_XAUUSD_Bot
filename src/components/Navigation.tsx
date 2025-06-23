@@ -11,7 +11,7 @@ import {
   UserCircle
 } from 'lucide-react';
 import { NotificationBell } from './NotificationBell';
-import { useAuthContext } from './auth/AuthProvider';
+import { useAuthContext } from '../contexts/AuthContext';
 
 interface NavigationProps {
   currentPage: string;
