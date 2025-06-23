@@ -17,22 +17,35 @@ function AppContent() {
   const [currentPage, setCurrentPage] = useState('landing');
 
   useEffect(() => {
-    // Auto-start trading engine when user is authenticated
+    // Effect to manage trading engine state and initial page based on authentication.
     if (user && profile) {
-      tradingEngine.startEngine().catch(console.error);
+      // User is authenticated
+      console.log('User authenticated, starting trading engine...');
+      tradingEngine.startEngine()
+        .then(() => console.log('Trading engine started successfully.'))
+        .catch(error => {
+          console.error('Failed to start trading engine:', error);
+          // toast.error('Failed to start trading engine. Please contact support.'); // Consider if user needs to see this
+        });
       
-      // Navigate to appropriate dashboard
+      // Navigate to the appropriate dashboard based on user role
       if (profile.role === 'admin') {
         setCurrentPage('admin');
       } else {
         setCurrentPage('dashboard');
       }
-    } else {
-      // Stop trading engine when user logs out
-      tradingEngine.stopEngine().catch(console.error);
+    } else if (!user && !loading) { // Ensure not loading to prevent premature stop on initial load
+      // User is not authenticated (logged out or session expired)
+      console.log('User not authenticated, stopping trading engine...');
+      tradingEngine.stopEngine()
+        .then(() => console.log('Trading engine stopped successfully.'))
+        .catch(error => {
+          console.error('Failed to stop trading engine:', error);
+          // toast.error('Failed to stop trading engine.'); // Consider if user needs to see this
+        });
       setCurrentPage('landing');
     }
-  }, [user, profile]);
+  }, [user, profile, loading]); // Added loading to dependency array
 
   if (loading) {
     return (

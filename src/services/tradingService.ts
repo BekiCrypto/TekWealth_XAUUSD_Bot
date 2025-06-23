@@ -304,9 +304,21 @@ export class TradingService {
   }
 
   // Private Methods
+
+  // ##################################################################################
+  // # CRITICAL SECURITY WARNING #
+  // ##################################################################################
+  // The `encryptPassword` method below uses `btoa` (Base64 encoding), WHICH IS NOT #
+  // ENCRYPTION AND IS COMPLETELY INSECURE for storing passwords.                     #
+  // THIS IS FOR DEMONSTRATION PURPOSES ONLY AND MUST BE REPLACED with a secure       #
+  // server-side hashing mechanism (e.g., Argon2, bcrypt) or proper credential        #
+  // management (e.g., OAuth, API keys) BEFORE ANY PRODUCTION USE.                    #
+  // Storing passwords this way will lead to severe security vulnerabilities.         #
+  // ##################################################################################
   private async encryptPassword(password: string): Promise<string> {
-    // In production, use proper encryption
-    return btoa(password); // Simple base64 encoding for demo
+    // In production, use proper encryption (SERVER-SIDE HASHING, NOT THIS!)
+    console.warn('[SECURITY_RISK] Using btoa for password encoding. DEMO ONLY. NOT FOR PRODUCTION.');
+    return btoa(password); // Simple base64 encoding for demo - HIGHLY INSECURE
   }
 
   private async testConnection(accountId: string): Promise<boolean> {
@@ -320,8 +332,10 @@ export class TradingService {
   }
 
   private async sendTradeToMT(trade: Trade): Promise<void> {
-    // In production, this would send the trade to MT4/MT5
-    console.log('Sending trade to MT platform:', trade);
+    // TODO: PRODUCTION - Implement actual MetaTrader 4/5 integration.
+    // This requires a server-side component or direct integration if the MT platform offers an API.
+    // This is a placeholder.
+    console.log('[TODO_PROD] Simulating sending trade to MT platform:', trade);
   }
 
   private calculateProfitLoss(trade: Trade, closePrice: number): number {
@@ -351,13 +365,16 @@ export class TradingService {
   }
 
   private initializePriceSocket() {
-    // In production, connect to real price feed
-    // For demo, simulate price updates
-    setInterval(() => {
-      const price = this.getCurrentPrice();
-      price.then(p => {
-        this.priceCallbacks.forEach(callback => callback(p));
-      });
+    // TODO: PRODUCTION - Connect to a real-time price feed WebSocket server.
+    // This is a placeholder that simulates price updates using getCurrentPrice (which is also simulated).
+    console.log('[TODO_PROD] Initializing simulated price socket.');
+    setInterval(async () => { // Made async to await getCurrentPrice
+      try {
+        const price = await this.getCurrentPrice(); // getCurrentPrice is async
+        this.priceCallbacks.forEach(callback => callback(price));
+      } catch (error) {
+        console.error('Error in simulated price socket update:', error);
+      }
     }, 5000); // Update every 5 seconds
   }
 }

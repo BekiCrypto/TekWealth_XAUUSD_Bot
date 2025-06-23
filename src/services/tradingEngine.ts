@@ -14,6 +14,12 @@ interface MarketData {
   timestamp: Date;
 }
 
+// IMPORTANT: This TradingEngine class runs on the client-side.
+// For a real financial application, core trading logic, real-time data processing,
+// and order execution should be handled by a secure, reliable server-side system.
+// This client-side engine is suitable for simulation, UI demonstration, or if
+// it's designed to communicate with a robust backend that handles actual trading.
+
 interface TradingSignal {
   action: 'BUY' | 'SELL' | 'CLOSE' | 'HOLD';
   confidence: number;
@@ -92,73 +98,90 @@ export class TradingEngine {
 
   private async updateMarketData() {
     try {
-      // Simulate real-time gold price feed
-      const basePrice = 2045;
-      const volatility = 0.5;
-      const spread = 0.3;
+      // TODO: PRODUCTION - Replace with actual real-time price feed (e.g., WebSocket).
+      // This is a simulated price feed.
+      const basePrice = 2045; // Simulated base price for XAUUSD
+      const volatility = 0.5; // Simulated price movement range
+      const spread = 0.3;     // Simulated spread
       
-      const random = (Math.random() - 0.5) * 2;
-      const price = basePrice + (random * volatility);
+      const randomFactor = (Math.random() - 0.5) * 2; // Generates a random number between -1 and 1
+      const price = basePrice + (randomFactor * volatility);
       
-      const marketData: MarketData = {
+      const currentMarketData: MarketData = {
         symbol: 'XAUUSD',
-        bid: price - spread / 2,
-        ask: price + spread / 2,
-        spread: spread,
+        bid: parseFloat((price - spread / 2).toFixed(2)), // Ensure two decimal places for currency
+        ask: parseFloat((price + spread / 2).toFixed(2)), // Ensure two decimal places
+        spread: parseFloat(spread.toFixed(2)),
         timestamp: new Date()
       };
 
-      this.marketData.set('XAUUSD', marketData);
+      this.marketData.set('XAUUSD', currentMarketData);
 
-      // Store price data in database
-      await this.storePriceData(marketData);
+      // Store price data in database (optional for client-side simulation, could be noisy)
+      // Consider if this is essential for the client-side engine's operation or if it's for historical logging.
+      // For a pure client-side simulation, storing every tick might be excessive.
+      // await this.storePriceData(currentMarketData);
 
-      // Check for trading opportunities
+      // Analyze market for all active sessions based on the new market data
       await this.analyzeMarketForAllSessions();
 
     } catch (error) {
-      console.error('Error updating market data:', error);
+      console.error('Error in updateMarketData:', error);
     }
   }
 
   private async storePriceData(data: MarketData) {
-    const price = (data.bid + data.ask) / 2;
+    // This function stores the simulated price data.
+    // For a production system with a real price feed, this might be handled by a server-side data ingestion service.
+    const price = parseFloat(((data.bid + data.ask) / 2).toFixed(2));
     
-    await supabase.from('price_data').insert({
+    const { error } = await supabase.from('price_data').insert({
       symbol: data.symbol,
       timestamp: data.timestamp.toISOString(),
-      open_price: price,
-      high_price: price,
+      open_price: price, // For tick data, open, high, low, close might all be the same.
+      high_price: price, // Adjust if aggregating into candles (e.g., 1m, 5m).
       low_price: price,
       close_price: price,
-      volume: Math.floor(Math.random() * 1000),
-      timeframe: '1m'
+      volume: Math.floor(Math.random() * 1000), // Simulated volume
+      timeframe: 'tick' // Indicate this is tick data, or aggregate to '1m' etc.
     });
+    if (error) {
+      console.warn('Error storing price data (simulation):', error.message); // Downgrade to warn as it's sim data
+    }
   }
 
   // Trading Logic
   private async startTradingLoop() {
+    console.log('Trading loop initiated.');
     const tradingLoop = async () => {
-      if (!this.engineRunning) return;
+      if (!this.engineRunning) {
+        console.log('Trading engine stopped, exiting trading loop.');
+        return;
+      }
 
       try {
         // Process all active sessions
-        for (const [sessionId, session] of this.activeSessions) {
+        for (const [_sessionId, session] of this.activeSessions) { // Use _sessionId if not directly used
           await this.processSession(session);
         }
 
-        // Check for position management
+        // Check for position management (SL/TP hits)
         await this.manageOpenPositions();
 
-        // Schedule next iteration
-        setTimeout(tradingLoop, 5000); // Run every 5 seconds
       } catch (error) {
-        console.error('Error in trading loop:', error);
-        setTimeout(tradingLoop, 10000); // Retry after 10 seconds on error
+        console.error('Critical error in trading loop:', error);
+        // Consider more robust error handling here, e.g., pausing specific sessions or the engine
+        // if errors are persistent.
+      } finally {
+        // Schedule next iteration regardless of error, but ensure engine is still running.
+        if (this.engineRunning) {
+          setTimeout(tradingLoop, 5000); // Run every 5 seconds
+        }
       }
     };
 
-    tradingLoop();
+    // Start the first iteration.
+    setTimeout(tradingLoop, 5000); // Initial delay before first run
   }
 
   private async processSession(session: BotSession) {

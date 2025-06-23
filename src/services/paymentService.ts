@@ -23,6 +23,7 @@ export class PaymentService {
     planType: 'conservative' | 'medium' | 'risky';
     paymentMethod: 'stripe' | 'crypto';
   }) {
+    // TODO: PRODUCTION - Plan prices should be fetched from a database or secure config, not hardcoded.
     const planPrices = {
       conservative: 299,
       medium: 599,
@@ -90,7 +91,9 @@ export class PaymentService {
     const stripe = await stripePromise;
     if (!stripe) throw new Error('Stripe not loaded');
 
-    // Create payment intent on server
+    // TODO: PRODUCTION - This '/api/create-payment-intent' endpoint needs to be a real, secure backend function (e.g., Supabase Function).
+    // It should handle creating the PaymentIntent with Stripe's SDK using a secret key.
+    // The current implementation is a placeholder and will not work.
     const response = await fetch('/api/create-payment-intent', {
       method: 'POST',
       headers: {
@@ -151,10 +154,13 @@ export class PaymentService {
   }
 
   // Crypto Payment Methods
+  // WARNING: Crypto payment methods below are highly simplified and not secure for production.
+  // Real crypto payment processing requires robust address generation, transaction monitoring on the blockchain,
+  // and secure handling of private keys (which should never be client-side).
   async createCryptoPayment(amount: number, currency: string = 'USDT') {
-    // Generate unique payment address or use static address
-    const paymentAddress = this.generateCryptoAddress();
-    const paymentId = this.generatePaymentId();
+    // TODO: PRODUCTION - Replace with secure, unique address generation per transaction. Static address is insecure.
+    const paymentAddress = this.generateCryptoAddress(); // Placeholder
+    const paymentId = this.generatePaymentId(); // Placeholder
 
     return {
       paymentId,
@@ -252,7 +258,9 @@ export class PaymentService {
   }
 
   private async cancelStripeSubscription(stripeSubscriptionId: string) {
-    // Cancel Stripe subscription via API
+    // TODO: PRODUCTION - This '/api/cancel-subscription' endpoint needs to be a real, secure backend function (e.g., Supabase Function).
+    // It should handle cancelling the Stripe subscription using Stripe's SDK with a secret key.
+    // The current implementation is a placeholder and will not work.
     const response = await fetch('/api/cancel-subscription', {
       method: 'POST',
       headers: {

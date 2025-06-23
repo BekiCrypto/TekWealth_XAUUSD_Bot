@@ -1,9 +1,10 @@
 import React, { createContext, useContext, ReactNode } from 'react';
+import { User } from '@supabase/supabase-js'; // Import Supabase User type
 import { useAuth } from '../../hooks/useAuth';
 import { Database } from '../../types/database';
 
 type Profile = Database['public']['Tables']['profiles']['Row'];
-type User = any; // Supabase User type
+// type User = any; // Supabase User type - Replaced with import
 
 interface AuthContextType {
   user: User | null;
