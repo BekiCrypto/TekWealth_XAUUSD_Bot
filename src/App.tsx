@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Toaster } from 'sonner';
-import { AuthProvider, useAuthContext } from './components/auth/AuthProvider';
+import { AuthProvider } from './components/auth/AuthProvider';
+import { useAuthContext } from './contexts/AuthContext';
 import { Navigation } from './components/Navigation';
 import { LandingPage } from './pages/LandingPage';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -8,7 +9,7 @@ import { UserDashboard } from './pages/UserDashboard';
 import { TradingBot } from './pages/TradingBot';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
-import { Backtesting } from './pages/Backtesting';
+import Backtesting from './pages/BacktestingPage';
 import { TradingEnginePage } from './pages/TradingEngine';
 import { tradingEngine } from './services/tradingEngine';
 
