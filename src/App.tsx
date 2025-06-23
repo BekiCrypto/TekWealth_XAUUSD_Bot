@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Toaster } from 'sonner'; // You can switch to 'react-hot-toast' if preferred
+import { Toaster } from 'sonner';
 import { AuthProvider, useAuthContext } from './components/auth/AuthProvider';
 import { Navigation } from './components/Navigation';
 import { LandingPage } from './pages/LandingPage';
@@ -19,7 +19,10 @@ function AppContent() {
 
   useEffect(() => {
     if (user && profile) {
-      tradingEngine.startEngine().catch(console.error);
+      console.log('User authenticated, starting trading engine...');
+      tradingEngine.startEngine()
+        .then(() => console.log('Trading engine started successfully.'))
+        .catch((error) => console.error('Failed to start trading engine:', error));
 
       if (profile.role === 'admin') {
         setCurrentPage('admin');
@@ -30,12 +33,16 @@ function AppContent() {
       if (profile.name) {
         setUserName(profile.name);
       }
-    } else {
-      tradingEngine.stopEngine().catch(console.error);
+    } else if (!user && !loading) {
+      console.log('User not authenticated, stopping trading engine...');
+      tradingEngine.stopEngine()
+        .then(() => console.log('Trading engine stopped successfully.'))
+        .catch((error) => console.error('Failed to stop trading engine:', error));
+
       setCurrentPage('landing');
       setUserName(undefined);
     }
-  }, [user, profile]);
+  }, [user, profile, loading]);
 
   if (loading) {
     return (
