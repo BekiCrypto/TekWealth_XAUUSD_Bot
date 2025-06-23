@@ -127,6 +127,8 @@ export function LoginForm({ onToggleMode, onSuccess }: LoginFormProps) {
           </p>
         </div>
 
+        {/* Removed demo account section for production security */}
+        {/*
         <div className="mt-6 pt-6 border-t border-gray-700">
           <div className="text-center text-sm text-gray-500">
             <p>Demo Accounts:</p>
@@ -134,6 +136,7 @@ export function LoginForm({ onToggleMode, onSuccess }: LoginFormProps) {
             <p>User: user@goldbot-pro.com / user123</p>
           </div>
         </div>
+        */}
       </div>
     </div>
   );

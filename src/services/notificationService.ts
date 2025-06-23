@@ -150,16 +150,23 @@ export class NotificationService {
 
   private async generateDailyReport(userId: string) {
     // Get user's trading data for today
+    // IMPORTANT: Timezone considerations. `new Date().toISOString().split('T')[0]` gets the current date in UTC.
+    // If `created_at` in the 'trades' table is stored in UTC, this comparison is fine.
+    // If server/client timezones differ, or if "today" needs to be based on user's local timezone,
+    // this logic would need adjustment, possibly using database functions for date parts.
     const today = new Date().toISOString().split('T')[0];
     
     const { data: trades, error } = await supabase
       .from('trades')
       .select('*')
       .eq('user_id', userId)
-      .gte('created_at', today + 'T00:00:00.000Z')
-      .lt('created_at', today + 'T23:59:59.999Z');
+      .gte('created_at', `${today}T00:00:00.000Z`) // Explicit UTC start
+      .lt('created_at', `${today}T23:59:59.999Z`);   // Explicit UTC end
 
-    if (error) return;
+    if (error) {
+      console.error(`Error fetching trades for daily report (user ${userId}):`, error);
+      return;
+    }
 
     const totalTrades = trades?.length || 0;
     const profitableTrades = trades?.filter(t => (t.profit_loss || 0) > 0).length || 0;
@@ -184,13 +191,20 @@ export class NotificationService {
   private async sendEmailNotification(notification: Notification) {
     try {
       // Get user profile for email
-      const { data: profile } = await supabase
+      const { data: profile, error: profileError } = await supabase
         .from('profiles')
         .select('email, full_name')
         .eq('id', notification.user_id)
         .single();
 
-      if (!profile) return;
+      if (profileError) {
+        console.error(`Error fetching profile for email notification ${notification.id}:`, profileError);
+        return;
+      }
+      if (!profile) {
+        console.warn(`Profile not found for user ${notification.user_id} during email notification ${notification.id}.`);
+        return;
+      }
 
       // Send email via SendGrid or similar service
       const emailData = {
@@ -199,45 +213,63 @@ export class NotificationService {
         html: this.generateEmailTemplate(notification, profile.full_name),
       };
 
-      // In production, integrate with SendGrid
-      console.log('Sending email:', emailData);
+      // TODO: PRODUCTION - Integrate with SendGrid or other email provider.
+      // This currently only logs to console.
+      console.log('[TODO_PROD] Simulating email sending:', emailData);
+      // Example: await sendgrid.send(emailData);
 
       // Update notification as sent
-      await supabase
+      const { error: updateError } = await supabase
         .from('notifications')
         .update({ email_sent: true })
         .eq('id', notification.id);
+      if (updateError) {
+        console.error(`Error updating email_sent status for notification ${notification.id}:`, updateError);
+      }
 
     } catch (error) {
-      console.error('Error sending email notification:', error);
+      console.error(`Critical error in sendEmailNotification for notification ${notification.id}:`, error);
     }
   }
 
   private async sendTelegramNotification(notification: Notification) {
     try {
-      // Get user's Telegram chat ID (would be stored in profile)
-      const { data: profile } = await supabase
+      // Get user's Telegram chat ID (would be stored in profile, e.g., profile.telegram_chat_id)
+      const { data: profile, error: profileError } = await supabase
         .from('profiles')
-        .select('*')
+        // .select('telegram_chat_id') // Assuming 'telegram_chat_id' field exists
+        .select('*') // For demo, fetching all, but specific field is better
         .eq('id', notification.user_id)
         .single();
 
-      if (!profile) return;
+      if (profileError) {
+        console.error(`Error fetching profile for Telegram notification ${notification.id}:`, profileError);
+        return;
+      }
+      if (!profile /* || !profile.telegram_chat_id */) { // Add check for actual chat_id field
+        console.warn(`Telegram chat ID not found for user ${notification.user_id} during Telegram notification ${notification.id}.`);
+        return;
+      }
 
       // Send Telegram message
       const telegramMessage = `🤖 *${notification.title}*\n\n${notification.message}`;
       
-      // In production, send via Telegram Bot API
-      console.log('Sending Telegram message:', telegramMessage);
+      // TODO: PRODUCTION - Send via Telegram Bot API using a library or HTTP request.
+      // This currently only logs to console.
+      console.log('[TODO_PROD] Simulating Telegram message sending to user:', notification.user_id, 'Message:', telegramMessage);
+      // Example: await telegramBot.sendMessage(profile.telegram_chat_id, telegramMessage, { parse_mode: 'Markdown' });
 
       // Update notification as sent
-      await supabase
+      const { error: updateError } = await supabase
         .from('notifications')
         .update({ telegram_sent: true })
         .eq('id', notification.id);
+      if (updateError) {
+        console.error(`Error updating telegram_sent status for notification ${notification.id}:`, updateError);
+      }
 
     } catch (error) {
-      console.error('Error sending Telegram notification:', error);
+      console.error(`Critical error in sendTelegramNotification for notification ${notification.id}:`, error);
     }
   }
 
