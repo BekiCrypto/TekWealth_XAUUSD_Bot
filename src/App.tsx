@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Toaster } from 'sonner'; // You can switch to 'react-hot-toast' if preferred
-import { AuthProvider, useAuthContext } from './components/auth/AuthProvider';
+import { Toaster } from 'react-hot-toast';
+import { AuthProvider } from './components/auth/AuthProvider';
 import { Navigation } from './components/Navigation';
 import { LandingPage } from './pages/LandingPage';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -8,32 +8,29 @@ import { UserDashboard } from './pages/UserDashboard';
 import { TradingBot } from './pages/TradingBot';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
-import { Backtesting } from './pages/Backtesting';
 import { TradingEnginePage } from './pages/TradingEngine';
+import { useAuthContext } from './components/auth/AuthProvider';
 import { tradingEngine } from './services/tradingEngine';
 
 function AppContent() {
   const { user, profile, loading } = useAuthContext();
   const [currentPage, setCurrentPage] = useState('landing');
-  const [userName, setUserName] = useState<string | undefined>();
 
   useEffect(() => {
+    // Auto-start trading engine when user is authenticated
     if (user && profile) {
       tradingEngine.startEngine().catch(console.error);
-
+      
+      // Navigate to appropriate dashboard
       if (profile.role === 'admin') {
         setCurrentPage('admin');
       } else {
         setCurrentPage('dashboard');
       }
-
-      if (profile.name) {
-        setUserName(profile.name);
-      }
     } else {
+      // Stop trading engine when user logs out
       tradingEngine.stopEngine().catch(console.error);
       setCurrentPage('landing');
-      setUserName(undefined);
     }
   }, [user, profile]);
 
@@ -60,19 +57,10 @@ function AppContent() {
         return <Analytics />;
       case 'settings':
         return <Settings />;
-      case 'backtesting':
-        return <Backtesting />;
       case 'engine':
         return <TradingEnginePage />;
       default:
-        return (
-          <LandingPage
-            onLogin={(role, name) => {
-              setCurrentPage(role === 'admin' ? 'admin' : 'dashboard');
-              setUserName(name);
-            }}
-          />
-        );
+        return <LandingPage />;
     }
   };
 
@@ -82,20 +70,14 @@ function AppContent() {
 
   return (
     <div className="min-h-screen bg-gray-950">
-      <Navigation
-        currentPage={currentPage}
+      <Navigation 
+        currentPage={currentPage} 
         onNavigate={setCurrentPage}
         userRole={profile?.role || null}
-        userName={userName}
-        onLogout={() => {
-          setCurrentPage('landing');
-          setUserName(undefined);
-        }}
       />
       <main className="ml-64 min-h-screen">
         {renderPage()}
       </main>
-      <Toaster richColors position="top-right" />
     </div>
   );
 }
@@ -104,6 +86,17 @@ function App() {
   return (
     <AuthProvider>
       <AppContent />
+      <Toaster 
+        position="top-right"
+        toastOptions={{
+          duration: 4000,
+          style: {
+            background: '#1f2937',
+            color: '#fff',
+            border: '1px solid #374151'
+          }
+        }}
+      />
     </AuthProvider>
   );
 }
