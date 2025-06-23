@@ -36,7 +36,7 @@ export function SignUpForm({ onToggleMode, onSuccess }: SignUpFormProps) {
         toast.success('Account created successfully! Please check your email to verify your account.');
         onSuccess();
       }
-    } catch (error) {
+    } catch (_error) { // Prefixed unused error variable
       toast.error('An unexpected error occurred');
     } finally {
       setLoading(false);

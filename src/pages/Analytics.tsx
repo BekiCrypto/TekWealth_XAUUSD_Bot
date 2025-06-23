@@ -3,8 +3,8 @@ import {
   BarChart3, 
   TrendingUp, 
   Calendar, 
-  Download,
-  Filter
+  Download
+  // Filter // Removed unused import
 } from 'lucide-react';
 import { 
   LineChart, 

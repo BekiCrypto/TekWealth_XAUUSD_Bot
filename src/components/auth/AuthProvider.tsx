@@ -1,27 +1,12 @@
-import React, { createContext, useContext, ReactNode } from 'react';
-import { User } from '@supabase/supabase-js'; // Import Supabase User type
+import React, { ReactNode } from 'react';
+// User and Database types are used in AuthContext.ts, not directly here anymore
 import { useAuth } from '../../hooks/useAuth';
-import { Database } from '../../types/database';
+import { AuthContext } from '../../contexts/AuthContext'; // Import the context
 
-type Profile = Database['public']['Tables']['profiles']['Row'];
-// type User = any; // Supabase User type - Replaced with import
-
-interface AuthContextType {
-  user: User | null;
-  profile: Profile | null;
-  loading: boolean;
-  signIn: (email: string, password: string) => Promise<any>;
-  signUp: (email: string, password: string, fullName: string) => Promise<any>;
-  signOut: () => Promise<any>;
-  updateProfile: (updates: Partial<Profile>) => Promise<any>;
-  isAdmin: boolean;
-  isSubscriber: boolean;
-}
-
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+// AuthContextType, Profile, and useAuthContext are now in AuthContext.ts
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const auth = useAuth();
+  const auth = useAuth(); // useAuth provides the full AuthContextType value
 
   return (
     <AuthContext.Provider value={auth}>
@@ -30,10 +15,5 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 }
 
-export function useAuthContext() {
-  const context = useContext(AuthContext);
-  if (context === undefined) {
-    throw new Error('useAuthContext must be used within an AuthProvider');
-  }
-  return context;
-}
+// useAuthContext is now imported from '../../contexts/AuthContext' by components that need it.
+// If AuthProvider itself needed to use it, it would import it too, but it provides the value.
