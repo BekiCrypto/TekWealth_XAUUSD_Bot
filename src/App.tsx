@@ -1,4 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { Toaster } from 'sonner'; // You can switch to 'react-hot-toast' if preferred
+import { AuthProvider, useAuthContext } from './components/auth/AuthProvider';
 import { Navigation } from './components/Navigation';
 import { LandingPage } from './pages/LandingPage';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -6,13 +8,45 @@ import { UserDashboard } from './pages/UserDashboard';
 import { TradingBot } from './pages/TradingBot';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
-import { Backtesting } from './pages/Backtesting'; // ✅ Added backtesting page
-import { Toaster } from 'sonner'; // Import Toaster
+import { Backtesting } from './pages/Backtesting';
+import { TradingEnginePage } from './pages/TradingEngine';
+import { tradingEngine } from './services/tradingEngine';
 
-function App() {
+function AppContent() {
+  const { user, profile, loading } = useAuthContext();
   const [currentPage, setCurrentPage] = useState('landing');
-  const [userRole, setUserRole] = useState<'admin' | 'subscriber' | null>(null);
   const [userName, setUserName] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (user && profile) {
+      tradingEngine.startEngine().catch(console.error);
+
+      if (profile.role === 'admin') {
+        setCurrentPage('admin');
+      } else {
+        setCurrentPage('dashboard');
+      }
+
+      if (profile.name) {
+        setUserName(profile.name);
+      }
+    } else {
+      tradingEngine.stopEngine().catch(console.error);
+      setCurrentPage('landing');
+      setUserName(undefined);
+    }
+  }, [user, profile]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-gray-400">Loading GoldBot Pro...</p>
+        </div>
+      </div>
+    );
+  }
 
   const renderPage = () => {
     switch (currentPage) {
@@ -28,20 +62,21 @@ function App() {
         return <Settings />;
       case 'backtesting':
         return <Backtesting />;
+      case 'engine':
+        return <TradingEnginePage />;
       default:
         return (
           <LandingPage
             onLogin={(role, name) => {
-              setUserRole(role);
-              setUserName(name);
               setCurrentPage(role === 'admin' ? 'admin' : 'dashboard');
+              setUserName(name);
             }}
           />
         );
     }
   };
 
-  if (currentPage === 'landing') {
+  if (!user || currentPage === 'landing') {
     return renderPage();
   }
 
@@ -50,11 +85,10 @@ function App() {
       <Navigation
         currentPage={currentPage}
         onNavigate={setCurrentPage}
-        userRole={userRole}
+        userRole={profile?.role || null}
         userName={userName}
         onLogout={() => {
           setCurrentPage('landing');
-          setUserRole(null);
           setUserName(undefined);
         }}
       />
@@ -63,6 +97,14 @@ function App() {
       </main>
       <Toaster richColors position="top-right" />
     </div>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   );
 }
 
