@@ -4,7 +4,7 @@ import {
   User, 
   Shield, 
   Bell, 
-  Smartphone,
+  // Smartphone, // Removed unused import
   Key,
   Wallet,
   Save

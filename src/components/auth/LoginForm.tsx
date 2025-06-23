@@ -32,7 +32,7 @@ export function LoginForm({ onToggleMode, onSuccess }: LoginFormProps) {
         toast.success('Welcome back!');
         onSuccess();
       }
-    } catch (error) {
+    } catch (_error) { // Prefixed unused error variable
       toast.error('An unexpected error occurred');
     } finally {
       setLoading(false);

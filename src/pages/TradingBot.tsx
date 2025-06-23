@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { tradingService, StrategyParams, BotSession as BotSessionType } from '../services/tradingService';
 import { useAuth } from '../hooks/useAuth';
-import { Bot, Play, Pause, Settings, AlertTriangle, CheckCircle, TrendingUp, Shield, Zap, PlusCircle, XCircle, RefreshCw, Activity } from 'lucide-react';
+import { Bot, Play, /* Pause, Settings, AlertTriangle, CheckCircle, TrendingUp, Shield, Zap, */ PlusCircle, XCircle, RefreshCw, /* Activity */ } from 'lucide-react'; // Removed unused icons
 import { toast } from 'sonner'; // Import toast
 
 // Define a more specific type for the form state within this component

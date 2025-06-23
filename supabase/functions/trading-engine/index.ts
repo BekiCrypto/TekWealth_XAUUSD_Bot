@@ -59,6 +59,7 @@ async function encryptPassword(password: string): Promise<string> {
   return `${ivBase64}:${encryptedBase64}`;
 }
 
+/*
 async function decryptPassword(encryptedPasswordWithIv: string): Promise<string> {
   const key = await getKeyFromVault();
   const parts = encryptedPasswordWithIv.split(':');
@@ -76,6 +77,7 @@ async function decryptPassword(encryptedPasswordWithIv: string): Promise<string>
 
   return new TextDecoder().decode(decryptedData);
 }
+*/
 // --- End Cryptography Helpers ---
 
 // --- Action Handler for Upserting Trading Account with Encrypted Password ---
@@ -102,7 +104,7 @@ async function upsertTradingAccountAction(supabase: any, data: any) {
       // They should be updated by a sync process with the trade provider if needed.
     };
 
-    let query = supabase.from('trading_accounts');
+    const query = supabase.from('trading_accounts');
     let result;
 
     if (accountId) { // If accountId is provided, it's an update
@@ -139,7 +141,7 @@ async function upsertTradingAccountAction(supabase: any, data: any) {
 
 
     // Do NOT return the encryptedPassword or plain password in the response
-    const { password_encrypted, ...accountToReturn } = savedAccount;
+    const { password_encrypted: _password_encrypted, ...accountToReturn } = savedAccount;
 
     return new Response(JSON.stringify(accountToReturn), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -1042,11 +1044,11 @@ async function sendEmail(
       return { success: true, messageId: messageId || undefined };
     } else {
       // Attempt to parse error body for better logging
-      let errorBodyText = await response.text();
+      const errorBodyText = await response.text();
       let errorBodyJson = null;
       try {
         errorBodyJson = JSON.parse(errorBodyText);
-      } catch (e) { /* ignore parsing error */ }
+      } catch (_e) { /* ignore parsing error */ }
 
       console.error(`Failed to send email. Status: ${response.status}`, errorBodyJson || errorBodyText);
       // Throw an error to trigger retry
@@ -2316,6 +2318,7 @@ class SimulatedTradeProvider implements ITradeExecutionProvider {
     return { time: new Date().toISOString() };
   }
 }
+} // Added missing brace for MetaTraderBridgeProvider class
 // --- End Trade Execution Abstraction ---
 
 // --- MetaTrader Bridge Provider ---
@@ -3257,20 +3260,29 @@ async function fetchAndStoreHistoricalData(supabase: any, data: any, apiKey: str
   let avFunction = '';
   let timeSeriesKeyPattern = ''; // Used to extract data from AV response
 
-  if (['1min', '5min', '15min', '30min', '60min'].includes(interval)) {
-    avFunction = 'FX_INTRADAY';
-    timeSeriesKeyPattern = `Time Series FX (${interval})`;
-  } else if (interval === 'daily') {
-    avFunction = 'FX_DAILY';
-    timeSeriesKeyPattern = `Time Series FX (Daily)`;
-  } else if (interval === 'weekly') {
-    avFunction = 'FX_WEEKLY';
-    timeSeriesKeyPattern = `Time Series FX (Weekly)`;
-  } else if (interval === 'monthly') {
-    avFunction = 'FX_MONTHLY';
-    timeSeriesKeyPattern = `Time Series FX (Monthly)`;
-  } else {
-    throw new Error(`Unsupported interval: ${interval}`);
+  switch (interval) {
+    case '1min':
+    case '5min':
+    case '15min':
+    case '30min':
+    case '60min':
+      avFunction = 'FX_INTRADAY';
+      timeSeriesKeyPattern = `Time Series FX (${interval})`;
+      break;
+    case 'daily':
+      avFunction = 'FX_DAILY';
+      timeSeriesKeyPattern = `Time Series FX (Daily)`;
+      break;
+    case 'weekly':
+      avFunction = 'FX_WEEKLY';
+      timeSeriesKeyPattern = `Time Series FX (Weekly)`;
+      break;
+    case 'monthly':
+      avFunction = 'FX_MONTHLY';
+      timeSeriesKeyPattern = `Time Series FX (Monthly)`;
+      break;
+    default:
+      throw new Error(`Unsupported interval: ${interval}`);
   }
 
   const url = `https://www.alphavantage.co/query?function=${avFunction}&from_symbol=${fromCurrency}&to_symbol=${toCurrency}&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}&datatype=json`;

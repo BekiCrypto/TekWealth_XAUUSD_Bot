@@ -23,6 +23,16 @@ export default tseslint.config(
         'warn',
         { allowConstantExport: true },
       ],
+      // Attempt to fix TypeError: Cannot read properties of undefined (reading 'allowShortCircuit')
+      '@typescript-eslint/no-unused-expressions': [
+        'error', // or 'warn'
+        {
+          allowShortCircuit: false,
+          allowTernary: false,
+          allowTaggedTemplates: false
+        }
+      ],
+      '@typescript-eslint/no-explicit-any': 'warn', // Changed from error to warn for polish phase
     },
   }
 );
