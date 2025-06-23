@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Toaster } from 'react-hot-toast';
-import { AuthProvider } from './components/auth/AuthProvider';
+import { Toaster } from 'sonner';
+import { AuthProvider, useAuthContext } from './components/auth/AuthProvider';
 import { Navigation } from './components/Navigation';
 import { LandingPage } from './pages/LandingPage';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -8,44 +8,41 @@ import { UserDashboard } from './pages/UserDashboard';
 import { TradingBot } from './pages/TradingBot';
 import { Analytics } from './pages/Analytics';
 import { Settings } from './pages/Settings';
+import { Backtesting } from './pages/Backtesting';
 import { TradingEnginePage } from './pages/TradingEngine';
-import { useAuthContext } from './components/auth/AuthProvider';
 import { tradingEngine } from './services/tradingEngine';
 
 function AppContent() {
   const { user, profile, loading } = useAuthContext();
   const [currentPage, setCurrentPage] = useState('landing');
+  const [userName, setUserName] = useState<string | undefined>();
 
   useEffect(() => {
-    // Effect to manage trading engine state and initial page based on authentication.
     if (user && profile) {
-      // User is authenticated
       console.log('User authenticated, starting trading engine...');
       tradingEngine.startEngine()
         .then(() => console.log('Trading engine started successfully.'))
-        .catch(error => {
-          console.error('Failed to start trading engine:', error);
-          // toast.error('Failed to start trading engine. Please contact support.'); // Consider if user needs to see this
-        });
-      
-      // Navigate to the appropriate dashboard based on user role
+        .catch((error) => console.error('Failed to start trading engine:', error));
+
       if (profile.role === 'admin') {
         setCurrentPage('admin');
       } else {
         setCurrentPage('dashboard');
       }
-    } else if (!user && !loading) { // Ensure not loading to prevent premature stop on initial load
-      // User is not authenticated (logged out or session expired)
+
+      if (profile.name) {
+        setUserName(profile.name);
+      }
+    } else if (!user && !loading) {
       console.log('User not authenticated, stopping trading engine...');
       tradingEngine.stopEngine()
         .then(() => console.log('Trading engine stopped successfully.'))
-        .catch(error => {
-          console.error('Failed to stop trading engine:', error);
-          // toast.error('Failed to stop trading engine.'); // Consider if user needs to see this
-        });
+        .catch((error) => console.error('Failed to stop trading engine:', error));
+
       setCurrentPage('landing');
+      setUserName(undefined);
     }
-  }, [user, profile, loading]); // Added loading to dependency array
+  }, [user, profile, loading]);
 
   if (loading) {
     return (
@@ -70,10 +67,19 @@ function AppContent() {
         return <Analytics />;
       case 'settings':
         return <Settings />;
+      case 'backtesting':
+        return <Backtesting />;
       case 'engine':
         return <TradingEnginePage />;
       default:
-        return <LandingPage />;
+        return (
+          <LandingPage
+            onLogin={(role, name) => {
+              setCurrentPage(role === 'admin' ? 'admin' : 'dashboard');
+              setUserName(name);
+            }}
+          />
+        );
     }
   };
 
@@ -83,14 +89,20 @@ function AppContent() {
 
   return (
     <div className="min-h-screen bg-gray-950">
-      <Navigation 
-        currentPage={currentPage} 
+      <Navigation
+        currentPage={currentPage}
         onNavigate={setCurrentPage}
         userRole={profile?.role || null}
+        userName={userName}
+        onLogout={() => {
+          setCurrentPage('landing');
+          setUserName(undefined);
+        }}
       />
       <main className="ml-64 min-h-screen">
         {renderPage()}
       </main>
+      <Toaster richColors position="top-right" />
     </div>
   );
 }
@@ -99,17 +111,6 @@ function App() {
   return (
     <AuthProvider>
       <AppContent />
-      <Toaster 
-        position="top-right"
-        toastOptions={{
-          duration: 4000,
-          style: {
-            background: '#1f2937',
-            color: '#fff',
-            border: '1px solid #374151'
-          }
-        }}
-      />
     </AuthProvider>
   );
 }
