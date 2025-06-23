@@ -9,10 +9,12 @@ import {
   LogOut,
   Crown,
   UserCircle // Added for potential user profile icon
-} from 'lucide-react';
+} 
+from 'lucide-react';
 import { NotificationBell } from './NotificationBell'; // Import NotificationBell
 
-interface NavigationProps {
+interface NavigationProps 
+{
   currentPage: string;
   onNavigate: (page: string) => void;
   userRole: 'admin' | 'subscriber' | null;
